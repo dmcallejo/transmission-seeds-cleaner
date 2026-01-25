@@ -1,0 +1,29 @@
+# Transmission Hardlink Checker Configuration
+
+# Transmission server settings
+transmission:
+  url: "http://localhost:9091/"
+  username: "username"
+  password: "password"
+
+# Age threshold for torrents (in days)
+# Torrents older than this will be checked
+age_threshold_days: 60
+
+# Directories where torrents are stored (filter which torrents to analyze)
+# Only torrents in these directories will be checked
+torrent_directories:
+  - "/path/to/torrent/storage1"
+  - "/path/to/torrent/storage2"
+  # Add more directories as needed
+
+# Directories to check for hardlinks (where to verify files are hardlinked)
+check_directories:
+  - "/path/to/check/directory1"
+  - "/path/to/check/directory2"
+  # Add more directories as needed
+
+# Optional: Logging settings
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "torrent_checker.log"

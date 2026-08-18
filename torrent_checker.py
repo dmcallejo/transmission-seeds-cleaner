@@ -73,6 +73,8 @@ class TransmissionClient:
         re.compile(r"\btorrent\b.{0,50}\b(not registered|unregistered|not found|does not exist|unknown)\b"),
         re.compile(r"\b(info[ _-]?hash|infohash)\b.{0,50}\b(not registered|not found|does not exist|unknown)\b"),
         re.compile(r"\b(unregistered|not registered)\s+torrent\b"),
+        re.compile(r"\btorrent\b.{0,80}\b(?:has been|was)\s+deleted\b"),
+        re.compile(r"\btorrent\b.{0,80}\bis\s+not\s+authorized\s+for\s+use\s+(?:on|with)\s+(?:this\s+)?tracker\b"),
     )
     
     def __init__(self, url: str, username: str, password: str):
@@ -100,8 +102,14 @@ class TransmissionClient:
             password=password,
             protocol=protocol
         )
+
+    def get_all_torrents(self) -> List:
+        """Fetch one complete Transmission torrent snapshot."""
+        return self.client.get_torrents()
     
-    def get_seeding_torrents(self, older_than_days: int) -> List[Dict]:
+    def get_seeding_torrents(
+        self, older_than_days: int, torrents: Optional[List] = None
+    ) -> List[Dict]:
         """
         Get all seeding torrents older than specified days.
         
@@ -109,7 +117,8 @@ class TransmissionClient:
             List of torrent dictionaries with id, name, added_date, files, and peer_count.
         """
         threshold_time = datetime.now(timezone.utc) - timedelta(days=older_than_days)
-        torrents = self.client.get_torrents()
+        if torrents is None:
+            torrents = self.client.get_torrents()
         
         old_seeding = []
         for torrent in torrents:
@@ -254,10 +263,11 @@ class TransmissionClient:
             return None
         return '; '.join(dict.fromkeys(reasons))
 
-    def get_unavailable_tracker_torrents(self) -> List[Dict]:
+    def get_unavailable_tracker_torrents(self, torrents: Optional[List] = None) -> List[Dict]:
         """Get torrents whose tracker responses definitively say they are gone."""
         unavailable = []
-        torrents = self.client.get_torrents()
+        if torrents is None:
+            torrents = self.client.get_torrents()
         torrents_with_tracker_stats = 0
         for torrent in torrents:
             if self._get_attr(torrent, 'tracker_stats', []) or []:
@@ -358,6 +368,12 @@ class HardlinkChecker:
         # Build inode cache for all files in torrent directories
         self._inode_cache: Dict[int, List[Path]] = {}
         self._build_inode_cache()
+
+        # Build the target index once. The previous implementation recursively
+        # scanned every target directory for every torrent file, which made
+        # runtime grow as (torrent files × target files).
+        self._target_inode_cache: Dict[int, List[Path]] = {}
+        self._build_target_inode_cache()
         
         # Map each inode to the analyzed torrent IDs that contain it.
         self._analyzed_torrents: Dict[int, Set[int]] = {}
@@ -504,20 +520,7 @@ class HardlinkChecker:
     
     def _has_hardlink_in_directory(self, file_path: Path, inode: int) -> bool:
         """Check if file has a hardlink in any of the target directories."""
-        try:
-            for target_dir in self.target_directories:
-                for item in target_dir.rglob('*'):
-                    if item.is_file() and item != file_path:
-                        try:
-                            if item.stat().st_ino == inode:
-                                return True
-                        except (OSError, PermissionError):
-                            continue
-            return False
-        except PermissionError:
-            logging.warning(f"Permission denied accessing target directories")
-        
-        return False
+        return any(item != file_path for item in self._target_inode_cache.get(inode, []))
     
     def _find_hardlinks(self, inode: int, exclude_path: Path) -> List[Path]:
         """Find all hardlinks for a given inode (excluding the original path)."""
@@ -544,6 +547,23 @@ class HardlinkChecker:
                 logging.warning(f"Permission denied accessing {torrent_dir}: {e}")
             except Exception as e:
                 logging.warning(f"Error scanning {torrent_dir}: {e}")
+
+    def _build_target_inode_cache(self) -> None:
+        """Build an inode-to-path index for all target-directory files."""
+        logging.info("Building inode cache for target directories...")
+        for target_dir in self.target_directories:
+            try:
+                for file_path in target_dir.rglob('*'):
+                    if file_path.is_file():
+                        try:
+                            inode = file_path.stat().st_ino
+                            self._target_inode_cache.setdefault(inode, []).append(file_path)
+                        except (OSError, PermissionError):
+                            continue
+            except PermissionError as e:
+                logging.warning(f"Permission denied accessing {target_dir}: {e}")
+            except Exception as e:
+                logging.warning(f"Error scanning {target_dir}: {e}")
     
     def _is_in_torrent_directories(self, path: Path) -> bool:
         """Check if a path is within any torrent directory."""
@@ -619,12 +639,20 @@ class TorrentAnalyzer:
             Analysis results dictionary.
         """
         logging.info(f"Fetching seeding torrents older than {age_threshold_days} days...")
-        all_torrents = self.transmission.get_seeding_torrents(age_threshold_days)
+        # Fetch the complete RPC snapshot once. Both the age and tracker
+        # analyses operate on the same snapshot, avoiding a second large
+        # torrent-get request and inconsistent results between the two scans.
+        rpc_torrents = self.transmission.get_all_torrents()
+        all_torrents = self.transmission.get_seeding_torrents(
+            age_threshold_days, torrents=rpc_torrents
+        )
         logging.info(
             "Checking tracker responses for unavailable torrents "
             "(all torrents; age threshold is not applied)..."
         )
-        unavailable_torrents = self.transmission.get_unavailable_tracker_torrents()
+        unavailable_torrents = self.transmission.get_unavailable_tracker_torrents(
+            torrents=rpc_torrents
+        )
 
         # Filter torrents to only those in torrent directories
         torrents = [t for t in all_torrents if self.hardlink_checker._is_in_torrent_directories(Path(t['download_dir']))]

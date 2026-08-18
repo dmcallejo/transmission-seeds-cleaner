@@ -2,14 +2,16 @@
 """
 Transmission Torrent Hardlink Checker
 
-Identifies seeding torrents older than a specified threshold and checks
-if their files are hardlinked into a target directory or other torrents.
+Identifies seeding torrents older than a specified threshold, checks if their
+files are hardlinked into a target directory or other torrents, and finds
+torrents that are no longer registered at their tracker.
 """
 
 import os
 import sys
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
@@ -64,6 +66,14 @@ class ConfigLoader:
 
 class TransmissionClient:
     """Wrapper for Transmission RPC client."""
+
+    # These indicate that the info hash is not present at the tracker. Other
+    # errors (timeouts, DNS failures, rate limiting, etc.) can be temporary.
+    _TORRENT_UNAVAILABLE_PATTERNS = (
+        re.compile(r"\btorrent\b.{0,50}\b(not registered|unregistered|not found|does not exist|unknown)\b"),
+        re.compile(r"\b(info[ _-]?hash|infohash)\b.{0,50}\b(not registered|not found|does not exist|unknown)\b"),
+        re.compile(r"\b(unregistered|not registered)\s+torrent\b"),
+    )
     
     def __init__(self, url: str, username: str, password: str):
         """Initialize Transmission client."""
@@ -156,18 +166,154 @@ class TransmissionClient:
                 })
         
         return old_seeding
+
+    @staticmethod
+    def _get_attr(obj, name: str, default=None):
+        """Read an attribute from RPC objects and dicts used by test doubles."""
+        if isinstance(obj, dict):
+            if name in obj:
+                return obj[name]
+            camel_name = re.sub(r'_([a-z])', lambda match: match.group(1).upper(), name)
+            return obj.get(camel_name, default)
+        try:
+            return getattr(obj, name, default)
+        except (AttributeError, KeyError, TypeError):
+            return default
+
+    @classmethod
+    def _is_torrent_unavailable_result(cls, result: str) -> bool:
+        """Return whether a tracker response says the torrent is not registered."""
+        if not isinstance(result, str):
+            return False
+        result = result.lower()
+        return any(pattern.search(result) for pattern in cls._TORRENT_UNAVAILABLE_PATTERNS)
+
+    @classmethod
+    def _get_tracker_unavailable_reason(cls, torrent) -> Optional[str]:
+        """
+        Return a reason when every reported tracker definitively rejects the
+        torrent, otherwise return None.
+
+        Missing/empty tracker status is treated as unknown. This prevents a
+        newly added torrent or a tracker that has not announced yet from being
+        deleted accidentally.
+        """
+        try:
+            tracker_stats = cls._get_attr(torrent, 'tracker_stats', []) or []
+        except Exception:
+            return None
+        if not tracker_stats:
+            # Some Transmission/RPC combinations do not return trackerStats.
+            # The aggregate error string is safe to use only when it contains
+            # an explicit torrent-not-registered message.
+            error_string = cls._get_attr(torrent, 'error_string', '') or ''
+            if cls._is_torrent_unavailable_result(error_string):
+                return error_string.strip()
+            return None
+
+        # A successful response from any tracker means the torrent is still
+        # available. Temporary failures must never qualify for deletion.
+        reasons = []
+        reported_trackers = 0
+        for tracker_stat in tracker_stats:
+            announce_result = cls._get_attr(tracker_stat, 'last_announce_result', '') or ''
+            scrape_result = cls._get_attr(tracker_stat, 'last_scrape_result', '') or ''
+            announce_succeeded = cls._get_attr(tracker_stat, 'last_announce_succeeded', None)
+            scrape_succeeded = cls._get_attr(tracker_stat, 'last_scrape_succeeded', None)
+
+            # Announce responses are authoritative. A scrape may be
+            # unsupported or fail independently of an announce, so only use
+            # it when the tracker has not reported an announce result.
+            if isinstance(announce_result, str) and announce_result.strip():
+                reported_trackers += 1
+                if announce_succeeded is True:
+                    return None
+                if not cls._is_torrent_unavailable_result(announce_result):
+                    return None
+                reasons.append(announce_result.strip())
+                continue
+
+            if scrape_succeeded is True:
+                return None
+            if not isinstance(scrape_result, str) or not scrape_result.strip():
+                # Backup trackers often have no response because Transmission
+                # never needed to contact them. They are not evidence that
+                # the torrent is available, so ignore them.
+                continue
+            reported_trackers += 1
+            if not cls._is_torrent_unavailable_result(scrape_result):
+                return None
+            reasons.append(scrape_result.strip())
+
+        if not reported_trackers:
+            error_string = cls._get_attr(torrent, 'error_string', '') or ''
+            if cls._is_torrent_unavailable_result(error_string):
+                return error_string.strip()
+            return None
+        if not reasons or reported_trackers != len(reasons):
+            return None
+        return '; '.join(dict.fromkeys(reasons))
+
+    def get_unavailable_tracker_torrents(self) -> List[Dict]:
+        """Get torrents whose tracker responses definitively say they are gone."""
+        unavailable = []
+        torrents = self.client.get_torrents()
+        torrents_with_tracker_stats = 0
+        for torrent in torrents:
+            if self._get_attr(torrent, 'tracker_stats', []) or []:
+                torrents_with_tracker_stats += 1
+            reason = self._get_tracker_unavailable_reason(torrent)
+            if reason is None:
+                continue
+
+            added_date = None
+            for attr_name in ['addedDate', 'added_date', 'add_date', 'date_added']:
+                value = self._get_attr(torrent, attr_name)
+                if value is not None:
+                    added_date = value
+                    break
+            if added_date is not None and added_date.tzinfo is None:
+                added_date = added_date.replace(tzinfo=timezone.utc)
+
+            files = self._get_torrent_files(torrent)
+            unavailable.append({
+                'id': self._get_attr(torrent, 'id'),
+                'name': self._get_attr(torrent, 'name', '<unnamed torrent>'),
+                'added_date': added_date,
+                'files': files,
+                'download_dir': self._get_attr(torrent, 'download_dir', ''),
+                'peer_count': 0,
+                'tracker_unavailable_reason': reason,
+            })
+
+        logging.debug(
+            "Tracker status scan inspected %d torrent(s), %d with tracker stats, found %d unavailable",
+            len(torrents),
+            torrents_with_tracker_stats,
+            len(unavailable),
+        )
+        return unavailable
     
     def _get_torrent_files(self, torrent) -> List[Dict]:
         """Extract file information from a torrent."""
         files = []
         try:
+            # Current transmission-rpc exposes files through get_files().
+            if hasattr(torrent, 'get_files') and callable(torrent.get_files):
+                for file_obj in torrent.get_files():
+                    files.append({
+                        'name': file_obj.name,
+                        'size': file_obj.size
+                    })
+                return files
+
             # Try different possible ways to access files
             if hasattr(torrent, 'files') and callable(torrent.files):
                 file_dict = torrent.files()
                 for file_obj in file_dict.values():
                     files.append({
                         'name': file_obj['name'],
-                        'size': file_obj['size']
+                        'size': file_obj.get('size', file_obj.get('length', 0))
                     })
             elif hasattr(torrent, 'files'):
                 # files might be a direct attribute
@@ -176,13 +322,13 @@ class TransmissionClient:
                     for file_obj in file_list.values():
                         files.append({
                             'name': file_obj['name'],
-                            'size': file_obj['size']
+                            'size': file_obj.get('size', file_obj.get('length', 0))
                         })
                 elif isinstance(file_list, list):
                     for file_obj in file_list:
                         files.append({
                             'name': file_obj.get('name', file_obj),
-                            'size': file_obj.get('size', 0)
+                            'size': file_obj.get('size', file_obj.get('length', 0))
                         })
         except Exception as e:
             logging.warning(f"Could not extract files from torrent: {e}")
@@ -213,8 +359,29 @@ class HardlinkChecker:
         self._inode_cache: Dict[int, List[Path]] = {}
         self._build_inode_cache()
         
-        # Track analyzed torrents for age validation
-        self._analyzed_torrents: Dict[int, Dict] = {}  # inode -> torrent info
+        # Map each inode to the analyzed torrent IDs that contain it.
+        self._analyzed_torrents: Dict[int, Set[int]] = {}
+
+    def get_torrent_file_paths(self, torrent: Dict) -> List[Path]:
+        """Return the local files belonging to a torrent that currently exist."""
+        torrent_path = Path(torrent['download_dir']) / torrent['name']
+        if torrent_path.is_file():
+            return [torrent_path]
+        if torrent_path.is_dir():
+            return self._get_file_paths(torrent_path)
+
+        # Use Transmission's file list when the expected root path is not
+        # present. This handles single-file torrents and avoids scanning an
+        # unrelated parent directory.
+        paths = []
+        for file_info in torrent.get('files', []):
+            file_name = file_info.get('name') if isinstance(file_info, dict) else None
+            if not file_name:
+                continue
+            file_path = Path(torrent['download_dir']) / file_name
+            if file_path.is_file():
+                paths.append(file_path)
+        return paths
     
     def check_torrent_hardlinks(self, torrent: Dict) -> Dict:
         """
@@ -237,36 +404,22 @@ class HardlinkChecker:
             'hardlinked_to_other_torrents': [],  # List of torrent IDs
             'files_checked': 0,
             'files_hardlinked': 0,
+            'disk_paths': [],
             'status': 'unknown',
+            'flag_reason': None,
             'should_flag': False
         }
         
-        # Try to find torrent - could be a directory or a single file
-        torrent_path = Path(torrent['download_dir']) / torrent['name']
-        
-        # Check if it's a file (single-file torrent)
-        if torrent_path.is_file():
-            torrent_files = [torrent_path]
-        elif torrent_path.is_dir():
-            # It's a directory, get all files in it
-            torrent_files = self._get_file_paths(torrent_path)
-        else:
-            # Try directly in download_dir
-            torrent_path = Path(torrent['download_dir'])
-            if torrent_path.is_dir():
-                torrent_files = self._get_file_paths(torrent_path)
-            else:
-                result['status'] = 'directory_not_found'
-                result['should_flag'] = True
-                return result
-        
+        torrent_files = self.get_torrent_file_paths(torrent)
         if not torrent_files:
-            logging.warning(f"[Torrent {torrent_id}] {torrent['name']}: No files found on disk")
-            result['status'] = 'no_files_found'
+            torrent_root = Path(torrent['download_dir']) / torrent['name']
+            result['status'] = 'no_files_found' if torrent_root.is_dir() else 'directory_not_found'
+            result['flag_reason'] = 'missing_files'
             result['should_flag'] = True
             return result
         
         result['files_checked'] = len(torrent_files)
+        result['disk_paths'] = [str(file_path) for file_path in torrent_files]
         
         # Check hardlinks for each file
         hardlinked_count = 0
@@ -289,14 +442,13 @@ class HardlinkChecker:
                     if other_links:
                         hardlinked_count += 1
                         
-                        # Find which torrent IDs these links belong to
-                        for link_path in other_links:
-                            # Try to match against known torrents to get their IDs
-                            for cached_inode, cached_torrent in self._analyzed_torrents.items():
-                                if cached_inode == inode:
-                                    torrent_id_linked = cached_torrent['torrent_id']
-                                    if torrent_id_linked != torrent_id:  # Don't include self
-                                        hardlinked_torrent_ids.add(torrent_id_linked)
+                        # Find which analyzed torrents these links belong to.
+                        hardlinked_torrent_ids.update(
+                            linked_id for linked_id in self._analyzed_torrents.get(inode, set())
+                            if linked_id != torrent_id
+                        )
+
+                self._analyzed_torrents.setdefault(inode, set()).add(torrent_id)
             
             except (OSError, PermissionError) as e:
                 logging.warning(f"[Torrent {torrent_id}] Could not check file {file_path.name}: {e}")
@@ -331,6 +483,8 @@ class HardlinkChecker:
             # Rule 3: Only flag if peer count > 2
             peer_count = result['peer_count']
             result['should_flag'] = isinstance(peer_count, int) and peer_count > 2
+            if result['should_flag']:
+                result['flag_reason'] = 'not_hardlinked_with_more_than_two_seeds'
         
         return result
     
@@ -439,6 +593,11 @@ class HardlinkChecker:
                 
                 # Flag only if NO linked torrents are younger (i.e., all are old)
                 result['should_flag'] = not any_linked_younger
+                result['flag_reason'] = (
+                    'only_hardlinked_to_old_torrents'
+                    if result['should_flag']
+                    else 'hardlinked_to_younger_torrent'
+                )
         
         return results
 
@@ -453,16 +612,26 @@ class TorrentAnalyzer:
     
     def analyze(self, age_threshold_days: int) -> Dict:
         """
-        Analyze all old seeding torrents for hardlink status.
+        Analyze old seeding torrents and find torrents no longer registered
+        at their tracker.
         
         Returns:
             Analysis results dictionary.
         """
         logging.info(f"Fetching seeding torrents older than {age_threshold_days} days...")
         all_torrents = self.transmission.get_seeding_torrents(age_threshold_days)
-        
+        logging.info(
+            "Checking tracker responses for unavailable torrents "
+            "(all torrents; age threshold is not applied)..."
+        )
+        unavailable_torrents = self.transmission.get_unavailable_tracker_torrents()
+
         # Filter torrents to only those in torrent directories
         torrents = [t for t in all_torrents if self.hardlink_checker._is_in_torrent_directories(Path(t['download_dir']))]
+        unavailable_torrents = [
+            t for t in unavailable_torrents
+            if self.hardlink_checker._is_in_torrent_directories(Path(t['download_dir']))
+        ]
         
         if torrents:
             logging.info(f"Found {len(torrents)} old seeding torrent(s) in torrent directories. Checking hardlinks...")
@@ -470,11 +639,11 @@ class TorrentAnalyzer:
                 logging.info(f"  (Skipped {len(all_torrents) - len(torrents)} torrent(s) not in torrent directories)")
         else:
             logging.info("No old seeding torrents found in torrent directories.")
-            return {
-                'timestamp': datetime.now().isoformat(),
-                'torrents_analyzed': 0,
-                'results': []
-            }
+
+        if unavailable_torrents:
+            logging.info(
+                f"Found {len(unavailable_torrents)} torrent(s) no longer registered at their tracker(s)."
+            )
         
         results = []
         threshold_time = datetime.now(timezone.utc) - timedelta(days=age_threshold_days)
@@ -487,10 +656,49 @@ class TorrentAnalyzer:
         
         # Validate hardlink ages to finalize flagging decisions
         results = self.hardlink_checker.validate_hardlink_age(results, threshold_time)
-        
+
+        # Tracker-unavailable torrents are deletion candidates regardless of
+        # age or Transmission's current status. Avoid duplicate IDs when a
+        # torrent is present in both analyses.
+        unavailable_by_id = {torrent['id']: torrent for torrent in unavailable_torrents}
+        analyzed_ids = {result['torrent_id'] for result in results}
+        for result in results:
+            unavailable = unavailable_by_id.get(result['torrent_id'])
+            if unavailable is not None:
+                result['status'] = 'tracker_unavailable'
+                result['tracker_unavailable'] = True
+                result['tracker_unavailable_reason'] = unavailable['tracker_unavailable_reason']
+                result['flag_reason'] = 'tracker_unavailable'
+                result['should_flag'] = True
+
+        for torrent in unavailable_torrents:
+            if torrent['id'] in analyzed_ids:
+                continue
+            results.append({
+                'torrent_id': torrent['id'],
+                'torrent_name': torrent['name'],
+                'added_date': torrent['added_date'],
+                'peer_count': torrent.get('peer_count', 0),
+                'hardlinked_to_target': False,
+                'hardlinked_to_other_torrents': [],
+                'files_checked': len(torrent.get('files', [])),
+                'files_hardlinked': 0,
+                'disk_paths': [
+                    str(path) for path in self.hardlink_checker.get_torrent_file_paths(torrent)
+                ],
+                'total_size': sum(file_info.get('size', 0) for file_info in torrent.get('files', [])),
+                'status': 'tracker_unavailable',
+                'tracker_unavailable': True,
+                'tracker_unavailable_reason': torrent['tracker_unavailable_reason'],
+                'flag_reason': 'tracker_unavailable',
+                'should_flag': True,
+                'download_dir': torrent['download_dir'],
+            })
+
         return {
             'timestamp': datetime.now().isoformat(),
-            'torrents_analyzed': len(torrents),
+            'torrents_analyzed': len(results),
+            'tracker_unavailable_torrents': len(unavailable_torrents),
             'age_threshold_days': age_threshold_days,
             'check_directories': [str(d) for d in self.hardlink_checker.target_directories],
             'results': results
@@ -517,13 +725,14 @@ def setup_logging(config: Dict) -> None:
     )
 
 
-def print_results(analysis: Dict) -> None:
+def print_results(analysis: Dict, verbose: bool = False) -> None:
     """Print analysis results in a readable format."""
     print("\n" + "="*80)
     print("TRANSMISSION HARDLINK ANALYSIS REPORT")
     print("="*80)
     print(f"Timestamp: {analysis['timestamp']}")
     print(f"Torrents Analyzed: {analysis['torrents_analyzed']}")
+    print(f"Tracker-unavailable torrents: {analysis.get('tracker_unavailable_torrents', 0)}")
     print(f"Age Threshold: {analysis.get('age_threshold_days')} days")
     check_dirs = analysis.get('check_directories', [])
     if len(check_dirs) == 1:
@@ -544,15 +753,21 @@ def print_results(analysis: Dict) -> None:
     
     print(f"STATISTICS")
     print(f"  Flagged torrents: {len(flagged)}")
+    tracker_flagged = [r for r in flagged if r.get('tracker_unavailable', False)]
+    other_flagged = [r for r in flagged if not r.get('tracker_unavailable', False)]
+    print(f"  Tracker-unavailable torrents to delete: {len(tracker_flagged)}")
+    print(f"  Other cleanup torrents to delete: {len(other_flagged)}")
     print(f"  OK torrents: {len(ok)}")
     print()
     
     # Sort each group alphabetically by torrent name
     ok_sorted = sorted(ok, key=lambda r: r['torrent_name'].lower())
-    flagged_sorted = sorted(flagged, key=lambda r: r['torrent_name'].lower())
+    tracker_flagged_sorted = sorted(tracker_flagged, key=lambda r: r['torrent_name'].lower())
+    other_flagged_sorted = sorted(other_flagged, key=lambda r: r['torrent_name'].lower())
     
-    # Print OK torrents first
-    if ok_sorted:
+    # OK torrent details are opt-in because large libraries can contain
+    # hundreds of healthy torrents.
+    if verbose and ok_sorted:
         print("✓ OK TORRENTS:")
         print("-" * 80)
         for result in ok_sorted:
@@ -561,6 +776,8 @@ def print_results(analysis: Dict) -> None:
             print(f"    Added: {result['added_date']}")
             print(f"    Seeds: {result['peer_count']}")
             print(f"    Files: {result['files_hardlinked']}/{result['files_checked']} hardlinked")
+            if result.get('tracker_unavailable'):
+                print(f"    Tracker response: {result['tracker_unavailable_reason']}")
             
             if result['hardlinked_to_target']:
                 print(f"    🔗 Hardlinked to: target")
@@ -569,31 +786,80 @@ def print_results(analysis: Dict) -> None:
                 print(f"    🔗 Hardlinked to: {torrent_ids_str}")
             
             print()
-    
-    # Print flagged torrents
-    if flagged_sorted:
-        print("⚠️ FLAGGED TORRENTS:")
+    elif ok_sorted:
+        print("OK torrent details omitted (use --verbose to show them).\n")
+
+    reason_labels = {
+        'missing_files': 'torrent data is missing from disk',
+        'not_hardlinked_with_more_than_two_seeds': 'not hardlinked and has more than two seeds',
+        'only_hardlinked_to_old_torrents': 'only hardlinked to torrents older than the threshold',
+        'hardlinked_to_younger_torrent': 'hardlinked to a younger torrent',
+    }
+
+    # Keep tracker deletions visually separate from the hardlink policy.
+    if tracker_flagged_sorted:
+        print("🗑️ TRACKER-UNAVAILABLE TORRENTS TO DELETE:")
         print("-" * 80)
-        for result in flagged_sorted:
+        for result in tracker_flagged_sorted:
+            print(f"  🗑️ [{result['torrent_id']}] {result['torrent_name']}")
+            print(f"    Status: {result['status']}")
+            print(f"    Deletion reason: tracker reported this torrent as unavailable")
+            print(f"    Tracker response: {result['tracker_unavailable_reason']}")
+            print()
+
+    if other_flagged_sorted:
+        print("⚠️ OTHER FLAGGED TORRENTS TO DELETE:")
+        print("-" * 80)
+        for result in other_flagged_sorted:
             print(f"  ⚠️ [{result['torrent_id']}] {result['torrent_name']}")
             print(f"    Status: {result['status']}")
+            print(f"    Deletion reason: {reason_labels.get(result.get('flag_reason'), result.get('flag_reason', 'cleanup rule'))}")
             print(f"    Added: {result['added_date']}")
             print(f"    Seeds: {result['peer_count']}")
             print(f"    Files: {result['files_hardlinked']}/{result['files_checked']} hardlinked")
-            
+
             if result['hardlinked_to_target']:
                 print(f"    🔗 Hardlinked to: target")
             elif result['hardlinked_to_other_torrents']:
                 torrent_ids_str = ', '.join(f"#{tid}" for tid in result['hardlinked_to_other_torrents'])
                 print(f"    🔗 Hardlinked to: {torrent_ids_str}")
-            
+
             print()
-    else:
-        print("⚠️ FLAGGED TORRENTS:")
-        print("-" * 80)
-        print("  No flagged torrents.\n")
+
+    if not flagged:
+        print("No torrents marked for deletion.\n")
     
-    return flagged_sorted
+    return flagged
+
+
+def calculate_disk_space_to_free(flagged: List[Dict]) -> Tuple[int, int]:
+    """Return (file_count, allocated_bytes) that deletion should free."""
+    disk_files = {}
+    for result in flagged:
+        for file_path in result.get('disk_paths', []):
+            try:
+                path_stat = Path(file_path).stat()
+                inode_key = (path_stat.st_dev, path_stat.st_ino)
+                if inode_key not in disk_files:
+                    allocated_size = getattr(path_stat, 'st_blocks', 0) * 512
+                    disk_files[inode_key] = {
+                        'size': allocated_size or path_stat.st_size,
+                        'link_count': path_stat.st_nlink,
+                        'paths_to_remove': 0,
+                    }
+                disk_files[inode_key]['paths_to_remove'] += 1
+            except (OSError, PermissionError):
+                continue
+
+    # A hardlinked inode only frees disk space when the last selected link is
+    # removed. st_blocks reflects allocated disk space more closely than the
+    # logical file size reported by Transmission.
+    total_disk_size = sum(
+        info['size'] for info in disk_files.values()
+        if info['paths_to_remove'] >= info['link_count']
+    )
+    total_files = sum(len(result.get('disk_paths', [])) for result in flagged)
+    return total_files, total_disk_size
 
 
 def prompt_delete_flagged(transmission_client: TransmissionClient, flagged: List[Dict]) -> None:
@@ -607,35 +873,7 @@ def prompt_delete_flagged(transmission_client: TransmissionClient, flagged: List
     
     # Calculate statistics
     total_torrents = len(flagged)
-    total_files = sum(r['files_checked'] for r in flagged)
-    
-    # Calculate actual space to be freed, considering hardlinks
-    # Group torrents by hardlink relationships to avoid counting shared space multiple times
-    flagged_ids = {r['torrent_id'] for r in flagged}
-    processed_ids = set()
-    total_disk_size = 0
-    
-    for result in flagged:
-        torrent_id = result['torrent_id']
-        
-        # Skip if we already counted this torrent as part of a hardlink group
-        if torrent_id in processed_ids:
-            continue
-        
-        torrent_size = result.get('total_size', 0)
-        
-        # Find all flagged torrents hardlinked to this one (including self)
-        hardlinked_group = {torrent_id}
-        hardlinked_group.update(
-            linked_id for linked_id in result['hardlinked_to_other_torrents']
-            if linked_id in flagged_ids
-        )
-        
-        # Count this size once for the entire hardlink group
-        total_disk_size += torrent_size
-        
-        # Mark all torrents in this group as processed
-        processed_ids.update(hardlinked_group)
+    total_files, total_disk_size = calculate_disk_space_to_free(flagged)
     
     # Format size for display
     def format_size(size_bytes: int) -> str:
@@ -651,6 +889,8 @@ def prompt_delete_flagged(transmission_client: TransmissionClient, flagged: List
     print("="*80)
     print(f"\nSUMMARY:")
     print(f"  Total torrents to delete: {total_torrents}")
+    print(f"    Tracker-unavailable: {sum(1 for r in flagged if r.get('tracker_unavailable'))}")
+    print(f"    Other cleanup rules: {sum(1 for r in flagged if not r.get('tracker_unavailable'))}")
     print(f"  Total files to remove: {total_files}")
     print(f"  Total disk space to free: {format_size(total_disk_size)}")
     print()
@@ -694,6 +934,11 @@ def main():
         action='store_true',
         help='Output results as JSON'
     )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Show details for OK torrents (omitted by default)'
+    )
     
     args = parser.parse_args()
     
@@ -731,7 +976,7 @@ def main():
         if args.json:
             print(json.dumps(analysis, indent=2, default=str))
         else:
-            flagged = print_results(analysis)
+            flagged = print_results(analysis, verbose=args.verbose)
         
         # Ask about deletion
         if not args.json and flagged:

@@ -6,6 +6,7 @@ A Python utility for identifying seeding torrents in Transmission that are older
 
 - Connects to a Transmission instance via RPC (supports HTTP and HTTPS)
 - Identifies seeding torrents older than a configurable threshold
+- Detects torrents whose tracker definitively reports them as unregistered
 - Checks if torrent files are hardlinked to target directories
 - Detects hardlinks between torrents and identifies relationship chains
 - Intelligent flagging logic: only flags torrents that need cleanup
@@ -98,20 +99,27 @@ Output results as JSON:
 python torrent_checker.py --json
 ```
 
+Show details for healthy torrents as well as flagged torrents:
+
+```bash
+python torrent_checker.py --verbose
+```
+
 ## Output
 
 ### Human-Readable Report
 
 The tool produces a detailed report showing:
 - **OK torrents** (✓): Properly hardlinked to target directories or linked to younger torrents
-- **Flagged torrents** (⚠️): Not hardlinked to target or only linked to other old torrents
+- **Tracker-unavailable torrents to delete** (🗑️): The tracker explicitly reports that the torrent is no longer registered
+- **Other flagged torrents to delete** (⚠️): Candidates selected by the hardlink cleanup rules, with the deletion reason shown
 - Hardlink status with torrent relationships
 - Seed count from tracker
 - File hardlink statistics
 
 After analysis, you'll be prompted to optionally delete flagged torrents with:
 - Summary of torrents and files to be removed
-- **Accurate disk space calculation** accounting for hardlinked files (no double-counting)
+- **Actual disk space calculation** based on files and hardlink counts currently present on disk
 - Confirmation prompt before any deletion
 
 ### JSON Output
@@ -129,6 +137,7 @@ python torrent_checker.py --json > report.json
 - **not_hardlinked**: Files have no hardlinks; they are unique to this torrent
 - **directory_not_found**: Torrent download directory doesn't exist
 - **no_files_found**: No files found in the torrent directory
+- **tracker_unavailable**: All reported trackers definitively rejected the torrent; it is eligible for deletion
 
 ## Flagged Torrents
 
@@ -143,6 +152,10 @@ Torrents are OK (✓) if:
 - OR they are hardlinked to other torrents that are YOUNGER than the threshold (still being actively downloaded)
 
 This intelligent logic avoids deleting torrents that are still being used as sources for younger downloads.
+
+Torrents that are no longer registered at their tracker are also flagged, regardless of age or seeding status. Temporary tracker errors such as timeouts or connection failures do not qualify, and a successful response from any tracker keeps the torrent out of this category. These torrents are limited to the configured torrent directories and are removed from Transmission with their local data after confirmation.
+
+Hardlinked torrents can still be flagged when they are linked only to torrents older than the configured threshold. The report labels these separately as `only_hardlinked_to_old_torrents`; this is part of the existing cleanup policy and is distinct from tracker-unavailable deletion.
 
 ## Logging
 
@@ -171,4 +184,3 @@ By default, logs are written to `torrent_checker.log` and printed to stdout. Adj
 - Check that torrents are actually seeding
 - Verify `age_threshold_days` is set appropriately
 - Check Transmission logs for issues
-

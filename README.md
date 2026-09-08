@@ -7,6 +7,7 @@ A Python utility for identifying seeding torrents in Transmission that are older
 - Connects to a Transmission instance via RPC (supports HTTP and HTTPS)
 - Identifies seeding torrents older than a configurable threshold
 - Detects torrents whose tracker definitively reports them as unregistered
+- Triggers Transmission data verification for torrents reporting corrupt data
 - Checks if torrent files are hardlinked to target directories
 - Detects hardlinks between torrents and identifies relationship chains
 - Intelligent flagging logic: only flags torrents that need cleanup
@@ -78,6 +79,8 @@ torrent_directory: "/path/to/torrent/storage"
 - **check_directory** (legacy): Single directory to check for hardlinks
 - **logging.level**: Logging verbosity level (DEBUG, INFO, WARNING, ERROR)
 - **logging.file**: Path to log file
+
+When Transmission reports a current corruption error, the script queues a data verification. Historical `corruptEver` values alone do not trigger verification because that field is cumulative. Torrents already being checked are skipped, and all requested verifications are sent in one RPC call.
 
 ## Usage
 

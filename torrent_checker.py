@@ -76,6 +76,7 @@ class TransmissionClient:
         re.compile(r"\btorrent\b.{0,80}\b(?:has been|was)\s+deleted\b"),
         re.compile(r"\btorrent\b.{0,80}\bis\s+not\s+authorized\s+for\s+use\s+(?:on|with)\s+(?:this\s+)?tracker\b"),
     )
+    _CORRUPTION_PATTERN = re.compile(r"\bcorrupt(?:ed|ion)?\b", re.IGNORECASE)
     
     def __init__(self, url: str, username: str, password: str):
         """Initialize Transmission client."""
@@ -106,6 +107,43 @@ class TransmissionClient:
     def get_all_torrents(self) -> List:
         """Fetch one complete Transmission torrent snapshot."""
         return self.client.get_torrents()
+
+    def verify_corrupt_torrents(self, torrents: List) -> List[int]:
+        """Trigger batched verification for torrents with a current corruption error."""
+        torrent_ids = []
+        for torrent in torrents:
+            error_string = self._get_attr(torrent, 'error_string', '') or ''
+            corruption_message = str(error_string).strip()
+            # corruptEver is cumulative historical data, not an indication
+            # that verification is currently required. Only a current
+            # corruption error should trigger a new verification.
+            reports_corruption = self._CORRUPTION_PATTERN.search(corruption_message) is not None
+            if not reports_corruption:
+                continue
+
+            status = str(self._get_attr(torrent, 'status', '')).lower()
+            if status in {'checking', 'check pending'}:
+                logging.debug(
+                    "Skipping verification for torrent %s; verification is already active",
+                    self._get_attr(torrent, 'id', '<unknown>'),
+                )
+                continue
+            torrent_id = self._get_attr(torrent, 'id')
+            if torrent_id is not None:
+                torrent_ids.append(torrent_id)
+
+        if not torrent_ids:
+            return []
+
+        try:
+            # transmission-rpc accepts a list of IDs, so use one request for
+            # the whole batch instead of one request per torrent.
+            self.client.verify_torrent(torrent_ids)
+            logging.info("Triggered data verification for %d corrupt torrent(s)", len(torrent_ids))
+            return torrent_ids
+        except Exception as e:
+            logging.error("Failed to trigger data verification: %s", e)
+            return []
     
     def get_seeding_torrents(
         self, older_than_days: int, torrents: Optional[List] = None
@@ -643,6 +681,7 @@ class TorrentAnalyzer:
         # analyses operate on the same snapshot, avoiding a second large
         # torrent-get request and inconsistent results between the two scans.
         rpc_torrents = self.transmission.get_all_torrents()
+        verification_ids = self.transmission.verify_corrupt_torrents(rpc_torrents)
         all_torrents = self.transmission.get_seeding_torrents(
             age_threshold_days, torrents=rpc_torrents
         )
@@ -727,6 +766,7 @@ class TorrentAnalyzer:
             'timestamp': datetime.now().isoformat(),
             'torrents_analyzed': len(results),
             'tracker_unavailable_torrents': len(unavailable_torrents),
+            'corrupt_torrents_verified': len(verification_ids),
             'age_threshold_days': age_threshold_days,
             'check_directories': [str(d) for d in self.hardlink_checker.target_directories],
             'results': results
@@ -761,6 +801,7 @@ def print_results(analysis: Dict, verbose: bool = False) -> None:
     print(f"Timestamp: {analysis['timestamp']}")
     print(f"Torrents Analyzed: {analysis['torrents_analyzed']}")
     print(f"Tracker-unavailable torrents: {analysis.get('tracker_unavailable_torrents', 0)}")
+    print(f"Corrupt torrents queued for verification: {analysis.get('corrupt_torrents_verified', 0)}")
     print(f"Age Threshold: {analysis.get('age_threshold_days')} days")
     check_dirs = analysis.get('check_directories', [])
     if len(check_dirs) == 1:
@@ -786,6 +827,7 @@ def print_results(analysis: Dict, verbose: bool = False) -> None:
     print(f"  Tracker-unavailable torrents to delete: {len(tracker_flagged)}")
     print(f"  Other cleanup torrents to delete: {len(other_flagged)}")
     print(f"  OK torrents: {len(ok)}")
+    print(f"  Torrents set to verify: {analysis.get('corrupt_torrents_verified', 0)}")
     print()
     
     # Sort each group alphabetically by torrent name
@@ -890,7 +932,11 @@ def calculate_disk_space_to_free(flagged: List[Dict]) -> Tuple[int, int]:
     return total_files, total_disk_size
 
 
-def prompt_delete_flagged(transmission_client: TransmissionClient, flagged: List[Dict]) -> None:
+def prompt_delete_flagged(
+    transmission_client: TransmissionClient,
+    flagged: List[Dict],
+    verification_count: int = 0,
+) -> None:
     """
     Prompt user to delete flagged torrents and their files.
     
@@ -919,6 +965,7 @@ def prompt_delete_flagged(transmission_client: TransmissionClient, flagged: List
     print(f"  Total torrents to delete: {total_torrents}")
     print(f"    Tracker-unavailable: {sum(1 for r in flagged if r.get('tracker_unavailable'))}")
     print(f"    Other cleanup rules: {sum(1 for r in flagged if not r.get('tracker_unavailable'))}")
+    print(f"  Torrents set to verify: {verification_count}")
     print(f"  Total files to remove: {total_files}")
     print(f"  Total disk space to free: {format_size(total_disk_size)}")
     print()
@@ -1008,7 +1055,11 @@ def main():
         
         # Ask about deletion
         if not args.json and flagged:
-            prompt_delete_flagged(transmission, flagged)
+            prompt_delete_flagged(
+                transmission,
+                flagged,
+                verification_count=analysis.get('corrupt_torrents_verified', 0),
+            )
         
         logging.info("Analysis complete.")
         

@@ -532,6 +532,12 @@ class HardlinkChecker:
             # Rule 2: Check if any linked torrents are younger than threshold
             # Will be evaluated after all torrents are analyzed
             result['should_flag'] = None  # To be determined after full analysis
+        elif hardlinked_count:
+            # A shared inode can belong to a torrent outside the age-filtered
+            # analysis set, so there may be no torrent ID to validate. It is
+            # still a real hardlink and must not be treated as an unlinked file.
+            result['status'] = 'hardlinked_to_other_torrents'
+            result['should_flag'] = False
         else:
             result['status'] = 'not_hardlinked'
             # Rule 3: Only flag if peer count > 2

@@ -154,6 +154,8 @@ Torrents are OK (✓) if:
 - They ARE hardlinked to target directories
 - OR they are hardlinked to other torrents that are YOUNGER than the threshold (still being actively downloaded)
 
+A detected hardlink still prevents the "more than two seeds" rule from treating a torrent as completely unlinked, even when the linked path belongs to a torrent outside the age-filtered analysis set. The older-torrent rule applies when linked torrents are identified and all are older than the threshold.
+
 This intelligent logic avoids deleting torrents that are still being used as sources for younger downloads.
 
 Torrents that are no longer registered at their tracker are also flagged, regardless of age or seeding status. Temporary tracker errors such as timeouts or connection failures do not qualify, and a successful response from any tracker keeps the torrent out of this category. These torrents are limited to the configured torrent directories and are removed from Transmission with their local data after confirmation.

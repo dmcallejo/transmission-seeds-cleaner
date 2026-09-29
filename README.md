@@ -1,11 +1,11 @@
 # Transmission Seeds Cleaner
 
-A Python utility for identifying seeding torrents in Transmission that are older than a specified threshold and checking if their files are hardlinked to a target directory or other torrents.
+A Python utility for identifying seeding torrents in Transmission that have seeded longer than a specified threshold and checking if their files are hardlinked to a target directory or other torrents.
 
 ## Features
 
 - Connects to a Transmission instance via RPC (supports HTTP and HTTPS)
-- Identifies seeding torrents older than a configurable threshold
+- Identifies seeding torrents that meet a configurable accumulated seeding-time threshold
 - Detects torrents whose tracker definitively reports them as unregistered
 - Triggers Transmission data verification for torrents reporting corrupt data
 - Checks if torrent files are hardlinked to target directories
@@ -42,8 +42,8 @@ transmission:
   username: "your-username"
   password: "your-password"
 
-# Age threshold in days - torrents older than this will be checked
-age_threshold_days: 60
+# Minimum accumulated seeding time required before checking torrents (in days)
+seeding_time_threshold_days: 60
 
 # Directories where torrents are stored (used to FILTER which torrents to analyze)
 torrent_directories:
@@ -72,7 +72,7 @@ torrent_directory: "/path/to/torrent/storage"
 - **transmission.url**: URL to your Transmission RPC interface (supports HTTP and HTTPS with standard ports 80/443)
 - **transmission.username**: Transmission username
 - **transmission.password**: Transmission password
-- **age_threshold_days**: Number of days; torrents added before this threshold will be checked
+- **seeding_time_threshold_days**: Minimum accumulated seeding duration in days required for private torrents before they are checked; public torrents bypass this threshold
 - **torrent_directories**: List of directories where torrents are stored. Only torrents in these directories will be analyzed
 - **torrent_directory** (legacy): Single directory where torrents are stored
 - **check_directories**: List of directories to check for hardlinks. These are the target directories where hardlinked files should exist
@@ -81,6 +81,8 @@ torrent_directory: "/path/to/torrent/storage"
 - **logging.file**: Path to log file
 
 When Transmission reports a current corruption error, the script queues a data verification. Historical `corruptEver` values alone do not trigger verification because that field is cumulative. Torrents already being checked are skipped, and all requested verifications are sent in one RPC call.
+
+Transmission's reported `seconds_seeding` value is used for this filter, so time spent downloading before a torrent completes does not count. Public torrents bypass the threshold; private torrents must meet it. If Transmission does not report whether a torrent is private, the checker applies the threshold. Existing configurations can keep `age_threshold_days`; it is accepted as a deprecated alias, but now means minimum seeding time rather than time since the torrent was added.
 
 ## Usage
 
@@ -113,10 +115,11 @@ python torrent_checker.py --verbose
 ### Human-Readable Report
 
 The tool produces a detailed report showing:
-- **OK torrents** (✓): Properly hardlinked to target directories or linked to younger torrents
+- **OK torrents** (✓): Properly hardlinked to target directories or linked to public torrents/private torrents below the seeding-time threshold
 - **Tracker-unavailable torrents to delete** (🗑️): The tracker explicitly reports that the torrent is no longer registered
 - **Other flagged torrents to delete** (⚠️): Candidates selected by the hardlink cleanup rules, with the deletion reason shown
 - Hardlink status with torrent relationships
+- Accumulated seeding time reported by Transmission
 - Seed count from tracker
 - File hardlink statistics
 
@@ -148,19 +151,19 @@ Torrents are flagged (⚠️) if:
 1. They are NOT hardlinked to the target directory AND
 2. AND either:
    - They have NO hardlinks at all, AND have more than 2 seeds
-   - OR all hardlinks are ONLY to other torrents that are also older than the threshold
+   - OR all identified hardlinks are ONLY to private torrents that have also met the seeding-time threshold
 
 Torrents are OK (✓) if:
 - They ARE hardlinked to target directories
-- OR they are hardlinked to other torrents that are YOUNGER than the threshold (still being actively downloaded)
+- OR they are hardlinked to public torrents, or to private torrents below the threshold or with unknown seeding time
 
-A detected hardlink still prevents the "more than two seeds" rule from treating a torrent as completely unlinked, even when the linked path belongs to a torrent outside the age-filtered analysis set. The older-torrent rule applies when linked torrents are identified and all are older than the threshold.
+A detected hardlink still prevents the "more than two seeds" rule from treating a torrent as completely unlinked, even when the linked path belongs to a torrent outside the seeding-time-filtered analysis set. The long-seeding rule applies when linked torrents are identified and all are private torrents that have met the threshold.
 
-This intelligent logic avoids deleting torrents that are still being used as sources for younger downloads.
+This logic avoids deleting torrents that are still being used as sources for public torrents or private torrents with less accumulated seeding time.
 
 Torrents that are no longer registered at their tracker are also flagged, regardless of age or seeding status. Temporary tracker errors such as timeouts or connection failures do not qualify, and a successful response from any tracker keeps the torrent out of this category. These torrents are limited to the configured torrent directories and are removed from Transmission with their local data after confirmation.
 
-Hardlinked torrents can still be flagged when they are linked only to torrents older than the configured threshold. The report labels these separately as `only_hardlinked_to_old_torrents`; this is part of the existing cleanup policy and is distinct from tracker-unavailable deletion.
+Hardlinked torrents can still be flagged when they are linked only to private torrents that have met the configured seeding-time threshold. The report labels these separately as `only_hardlinked_to_long_seeded_torrents`; this is part of the existing cleanup policy and is distinct from tracker-unavailable deletion.
 
 ## Logging
 
@@ -187,5 +190,5 @@ By default, logs are written to `torrent_checker.log` and printed to stdout. Adj
 ### No Torrents Found
 
 - Check that torrents are actually seeding
-- Verify `age_threshold_days` is set appropriately
+- Verify `seeding_time_threshold_days` is set appropriately
 - Check Transmission logs for issues

@@ -2,7 +2,7 @@
 """
 Transmission Torrent Hardlink Checker
 
-Identifies seeding torrents older than a specified threshold, checks if their
+Identifies seeding torrents that have seeded longer than a specified threshold, checks if their
 files are hardlinked into a target directory or other torrents, and finds
 torrents that are no longer registered at their tracker.
 """
@@ -11,8 +11,9 @@ import os
 import sys
 import json
 import logging
+import math
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 import argparse
@@ -40,11 +41,22 @@ class ConfigLoader:
     @staticmethod
     def _validate_config(config: Dict) -> None:
         """Validate required configuration fields."""
-        required_keys = ['transmission', 'age_threshold_days']
-        for key in required_keys:
-            if key not in config:
-                raise ValueError(f"Missing required configuration key: {key}")
-        
+        if 'transmission' not in config:
+            raise ValueError("Missing required configuration key: 'transmission'")
+        if 'seeding_time_threshold_days' not in config and 'age_threshold_days' not in config:
+            raise ValueError(
+                "Missing required configuration key: 'seeding_time_threshold_days'"
+            )
+        threshold_days = config.get(
+            'seeding_time_threshold_days', config.get('age_threshold_days')
+        )
+        if (
+            not isinstance(threshold_days, (int, float))
+            or isinstance(threshold_days, bool)
+            or (isinstance(threshold_days, float) and not math.isfinite(threshold_days))
+            or threshold_days < 0
+        ):
+            raise ValueError("Seeding time threshold must be a non-negative number of days")
         # Validate that at least one directory option is specified for check directories
         has_check_dir = 'check_directory' in config and config['check_directory'] is not None
         has_check_dirs = 'check_directories' in config and config['check_directories'] is not None
@@ -146,41 +158,62 @@ class TransmissionClient:
             return []
     
     def get_seeding_torrents(
-        self, older_than_days: int, torrents: Optional[List] = None
+        self, seeding_time_threshold_days: float, torrents: Optional[List] = None
     ) -> List[Dict]:
         """
-        Get all seeding torrents older than specified days.
+        Get seeding torrents whose accumulated seeding time meets the threshold.
         
         Returns:
-            List of torrent dictionaries with id, name, added_date, files, and peer_count.
+            List of torrent dictionaries with identity, timestamps, seeding time, files, and peer count.
         """
-        threshold_time = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+        threshold_seconds = seeding_time_threshold_days * 24 * 60 * 60
         if torrents is None:
             torrents = self.client.get_torrents()
         
-        old_seeding = []
+        eligible_seeding = []
         for torrent in torrents:
             # Check if torrent is seeding
-            if torrent.status != 'seeding':
+            if self._get_attr(torrent, 'status') != 'seeding':
                 continue
-            
-            # Get the added date using different possible attribute names
+
+            torrent_name = self._get_attr(torrent, 'name', '<unnamed torrent>')
+            is_private = self._get_attr(torrent, 'is_private')
+            seeding_seconds = self._get_attr(torrent, 'seconds_seeding')
+            if is_private is not False:
+                if (
+                    not isinstance(seeding_seconds, (int, float))
+                    or isinstance(seeding_seconds, bool)
+                    or (isinstance(seeding_seconds, float) and not math.isfinite(seeding_seconds))
+                    or seeding_seconds < 0
+                ):
+                    logging.warning(
+                        "Could not determine seeding time for private or privacy-unknown torrent %s; skipping it",
+                        torrent_name,
+                    )
+                    continue
+                if seeding_seconds < threshold_seconds:
+                    continue
+            elif (
+                not isinstance(seeding_seconds, (int, float))
+                or isinstance(seeding_seconds, bool)
+                or (isinstance(seeding_seconds, float) and not math.isfinite(seeding_seconds))
+                or seeding_seconds < 0
+            ):
+                # Public torrents bypass the duration filter; retain a valid
+                # duration for reporting when Transmission provides one.
+                seeding_seconds = None
+
+            # Added date is report metadata only; eligibility comes from the
+            # accumulated seeding time reported by Transmission.
             added_date = None
-            for attr_name in ['addedDate', 'added_date', 'add_date', 'date_added']:
-                if hasattr(torrent, attr_name):
-                    added_date = getattr(torrent, attr_name)
+            for attr_name in ('added_date', 'add_date', 'date_added'):
+                added_date = self._get_attr(torrent, attr_name)
+                if added_date is not None:
                     break
-            
-            if added_date is None:
-                logging.warning(f"Could not determine added date for torrent {torrent.name}")
-                continue
-            
-            # Ensure added_date is timezone-aware for comparison
-            if added_date.tzinfo is None:
+            if added_date is not None and added_date.tzinfo is None:
                 added_date = added_date.replace(tzinfo=timezone.utc)
-            
-            # Check if torrent is old enough
-            if added_date < threshold_time:
+
+            if is_private is False or seeding_seconds >= threshold_seconds:
                 # Get seed count from tracker stats (most reliable source)
                 seed_count = 0
                 
@@ -202,30 +235,36 @@ class TransmissionClient:
                         if isinstance(val, int) and val >= 0:
                             seed_count = val
                 
-                old_seeding.append({
-                    'id': torrent.id,
-                    'name': torrent.name,
+                eligible_seeding.append({
+                    'id': self._get_attr(torrent, 'id'),
+                    'name': torrent_name,
                     'added_date': added_date,
+                    'seeding_time_seconds': seeding_seconds,
+                    'is_private': is_private,
                     'files': self._get_torrent_files(torrent),
-                    'download_dir': torrent.download_dir,
+                    'download_dir': self._get_attr(torrent, 'download_dir', ''),
                     'peer_count': seed_count,
                     'torrent_obj': torrent  # Keep reference for seed count lookup
                 })
         
-        return old_seeding
+        return eligible_seeding
 
     @staticmethod
     def _get_attr(obj, name: str, default=None):
         """Read an attribute from RPC objects and dicts used by test doubles."""
+        camel_name = re.sub(r'_([a-z])', lambda match: match.group(1).upper(), name)
         if isinstance(obj, dict):
             if name in obj:
                 return obj[name]
-            camel_name = re.sub(r'_([a-z])', lambda match: match.group(1).upper(), name)
             return obj.get(camel_name, default)
-        try:
-            return getattr(obj, name, default)
-        except (AttributeError, KeyError, TypeError):
-            return default
+        for attr_name in dict.fromkeys((name, camel_name)):
+            try:
+                value = getattr(obj, attr_name, default)
+            except (AttributeError, KeyError, TypeError):
+                continue
+            if value is not default:
+                return value
+        return default
 
     @classmethod
     def _is_torrent_unavailable_result(cls, result: str) -> bool:
@@ -328,6 +367,8 @@ class TransmissionClient:
                 'id': self._get_attr(torrent, 'id'),
                 'name': self._get_attr(torrent, 'name', '<unnamed torrent>'),
                 'added_date': added_date,
+                'seeding_time_seconds': self._get_attr(torrent, 'seconds_seeding'),
+                'is_private': self._get_attr(torrent, 'is_private'),
                 'files': files,
                 'download_dir': self._get_attr(torrent, 'download_dir', ''),
                 'peer_count': 0,
@@ -443,7 +484,7 @@ class HardlinkChecker:
         
         Flagging rules:
         - Flag if NOT linked to target directories
-        - Don't flag if linked to other torrents AND any linked torrents are younger than threshold
+        - Don't flag if linked to a public torrent or to a private torrent below the seeding-time threshold
         
         Returns:
             Dictionary with hardlink status information.
@@ -453,6 +494,8 @@ class HardlinkChecker:
             'torrent_id': torrent_id,
             'torrent_name': torrent['name'],
             'added_date': torrent['added_date'],
+            'seeding_time_seconds': torrent.get('seeding_time_seconds'),
+            'is_private': torrent.get('is_private'),
             'peer_count': torrent.get('peer_count', 0),
             'hardlinked_to_target': False,
             'hardlinked_to_other_torrents': [],  # List of torrent IDs
@@ -529,7 +572,7 @@ class HardlinkChecker:
             result['should_flag'] = False  # Rule 1: Linked to target = OK
         elif hardlinked_torrent_ids:
             result['status'] = 'hardlinked_to_other_torrents'
-            # Rule 2: Check if any linked torrents are younger than threshold
+            # Rule 2: Public torrents or private torrents below the seeding-time threshold protect links.
             # Will be evaluated after all torrents are analyzed
             result['should_flag'] = None  # To be determined after full analysis
         elif hardlinked_count:
@@ -625,42 +668,62 @@ class HardlinkChecker:
             pass
         return False
     
-    def validate_hardlink_age(self, results: List[Dict], age_threshold: datetime) -> List[Dict]:
+    def validate_hardlink_seeding_time(
+        self,
+        results: List[Dict],
+        seeding_time_threshold_seconds: float,
+        seeding_time_by_torrent_id: Optional[Dict[int, float]] = None,
+        public_torrent_ids: Optional[Set[int]] = None,
+    ) -> List[Dict]:
         """
-        Validate hardlinked torrents to apply correct flagging rules.
+        Validate hardlinked torrents using their accumulated seeding time.
         
         Rules:
         - OK if hardlinked to target directories
-        - OK if hardlinked to other torrents AND any of those torrents are younger than threshold
-        - FLAG if NOT linked to target AND (not linked at all OR all linked torrents are older than threshold)
+        - OK if hardlinked to a public torrent or a private torrent below the seeding-time threshold
+        - FLAG if all identified linked torrents meet the seeding-time threshold
         """
-        # Build a map of torrent ID to added date
-        torrent_by_id = {r['torrent_id']: r['added_date'] for r in results}
+        if seeding_time_by_torrent_id is None:
+            seeding_time_by_torrent_id = {
+                result['torrent_id']: result.get('seeding_time_seconds')
+                for result in results
+            }
+        if public_torrent_ids is None:
+            public_torrent_ids = {
+                result['torrent_id'] for result in results
+                if result.get('is_private') is False
+            }
         
         # Check each result that has pending flag validation
         for result in results:
             if result['should_flag'] is None:  # Pending determination
-                # This torrent is hardlinked to others - check if ANY are younger than threshold
-                # If any linked torrent is younger, it's OK (don't flag)
-                # If all linked torrents are older, it's FLAG
+                # Unknown seeding time is treated conservatively like a short
+                # seeding time: do not flag a torrent that may still be needed.
+                any_linked_below_threshold_or_unknown = False
                 
-                any_linked_younger = False
-                
-                # Check the linked torrent IDs directly from the result
                 for linked_torrent_id in result['hardlinked_to_other_torrents']:
-                    if linked_torrent_id in torrent_by_id:
-                        linked_added_date = torrent_by_id[linked_torrent_id]
-                        # If ANY linked torrent is younger than threshold, it's OK
-                        if linked_added_date > age_threshold:
-                            any_linked_younger = True
-                            break
+                    if linked_torrent_id in public_torrent_ids:
+                        any_linked_below_threshold_or_unknown = True
+                        break
+                    linked_seeding_seconds = seeding_time_by_torrent_id.get(linked_torrent_id)
+                    if (
+                        not isinstance(linked_seeding_seconds, (int, float))
+                        or isinstance(linked_seeding_seconds, bool)
+                        or (
+                            isinstance(linked_seeding_seconds, float)
+                            and not math.isfinite(linked_seeding_seconds)
+                        )
+                        or linked_seeding_seconds < seeding_time_threshold_seconds
+                    ):
+                        any_linked_below_threshold_or_unknown = True
+                        break
                 
-                # Flag only if NO linked torrents are younger (i.e., all are old)
-                result['should_flag'] = not any_linked_younger
+                # Flag only if every identified linked torrent has met the threshold.
+                result['should_flag'] = not any_linked_below_threshold_or_unknown
                 result['flag_reason'] = (
-                    'only_hardlinked_to_old_torrents'
+                    'only_hardlinked_to_long_seeded_torrents'
                     if result['should_flag']
-                    else 'hardlinked_to_younger_torrent'
+                    else 'hardlinked_to_public_shorter_seeded_or_unknown_torrent'
                 )
         
         return results
@@ -674,26 +737,41 @@ class TorrentAnalyzer:
         self.transmission = transmission_client
         self.hardlink_checker = hardlink_checker
     
-    def analyze(self, age_threshold_days: int) -> Dict:
+    def analyze(self, seeding_time_threshold_days: float) -> Dict:
         """
-        Analyze old seeding torrents and find torrents no longer registered
+        Analyze long-seeding torrents and find torrents no longer registered
         at their tracker.
         
         Returns:
             Analysis results dictionary.
         """
-        logging.info(f"Fetching seeding torrents older than {age_threshold_days} days...")
-        # Fetch the complete RPC snapshot once. Both the age and tracker
+        logging.info(
+            "Checking seeding time for private torrents (minimum %s days)...",
+            seeding_time_threshold_days,
+        )
+        # Fetch the complete RPC snapshot once. Both the seeding-time and tracker
         # analyses operate on the same snapshot, avoiding a second large
         # torrent-get request and inconsistent results between the two scans.
         rpc_torrents = self.transmission.get_all_torrents()
         verification_ids = self.transmission.verify_corrupt_torrents(rpc_torrents)
         all_torrents = self.transmission.get_seeding_torrents(
-            age_threshold_days, torrents=rpc_torrents
+            seeding_time_threshold_days, torrents=rpc_torrents
         )
+        seeding_time_threshold_seconds = seeding_time_threshold_days * 24 * 60 * 60
+        seeding_time_by_torrent_id = {
+            self.transmission._get_attr(torrent, 'id'): self.transmission._get_attr(
+                torrent, 'seconds_seeding'
+            )
+            for torrent in rpc_torrents
+        }
+        public_torrent_ids = {
+            self.transmission._get_attr(torrent, 'id')
+            for torrent in rpc_torrents
+            if self.transmission._get_attr(torrent, 'is_private') is False
+        }
         logging.info(
             "Checking tracker responses for unavailable torrents "
-            "(all torrents; age threshold is not applied)..."
+            "(all torrents; seeding-time threshold is not applied)..."
         )
         unavailable_torrents = self.transmission.get_unavailable_tracker_torrents(
             torrents=rpc_torrents
@@ -707,11 +785,14 @@ class TorrentAnalyzer:
         ]
         
         if torrents:
-            logging.info(f"Found {len(torrents)} old seeding torrent(s) in torrent directories. Checking hardlinks...")
+            logging.info(
+                "Found %d eligible seeding torrent(s) in torrent directories. Checking hardlinks...",
+                len(torrents),
+            )
             if len(torrents) < len(all_torrents):
                 logging.info(f"  (Skipped {len(all_torrents) - len(torrents)} torrent(s) not in torrent directories)")
         else:
-            logging.info("No old seeding torrents found in torrent directories.")
+            logging.info("No seeding torrents met the threshold in torrent directories.")
 
         if unavailable_torrents:
             logging.info(
@@ -719,16 +800,19 @@ class TorrentAnalyzer:
             )
         
         results = []
-        threshold_time = datetime.now(timezone.utc) - timedelta(days=age_threshold_days)
-        
         for torrent in torrents:
             logging.info(f"Checking torrent: {torrent['name']}")
             result = self.hardlink_checker.check_torrent_hardlinks(torrent)
             result['download_dir'] = torrent['download_dir']  # Add for validation
             results.append(result)
         
-        # Validate hardlink ages to finalize flagging decisions
-        results = self.hardlink_checker.validate_hardlink_age(results, threshold_time)
+        # Validate linked torrents using the same seeding-time threshold.
+        results = self.hardlink_checker.validate_hardlink_seeding_time(
+            results,
+            seeding_time_threshold_seconds,
+            seeding_time_by_torrent_id,
+            public_torrent_ids,
+        )
 
         # Tracker-unavailable torrents are deletion candidates regardless of
         # age or Transmission's current status. Avoid duplicate IDs when a
@@ -751,6 +835,8 @@ class TorrentAnalyzer:
                 'torrent_id': torrent['id'],
                 'torrent_name': torrent['name'],
                 'added_date': torrent['added_date'],
+                'seeding_time_seconds': torrent.get('seeding_time_seconds'),
+                'is_private': torrent.get('is_private'),
                 'peer_count': torrent.get('peer_count', 0),
                 'hardlinked_to_target': False,
                 'hardlinked_to_other_torrents': [],
@@ -773,7 +859,7 @@ class TorrentAnalyzer:
             'torrents_analyzed': len(results),
             'tracker_unavailable_torrents': len(unavailable_torrents),
             'corrupt_torrents_verified': len(verification_ids),
-            'age_threshold_days': age_threshold_days,
+            'seeding_time_threshold_days': seeding_time_threshold_days,
             'check_directories': [str(d) for d in self.hardlink_checker.target_directories],
             'results': results
         }
@@ -808,7 +894,7 @@ def print_results(analysis: Dict, verbose: bool = False) -> None:
     print(f"Torrents Analyzed: {analysis['torrents_analyzed']}")
     print(f"Tracker-unavailable torrents: {analysis.get('tracker_unavailable_torrents', 0)}")
     print(f"Corrupt torrents queued for verification: {analysis.get('corrupt_torrents_verified', 0)}")
-    print(f"Age Threshold: {analysis.get('age_threshold_days')} days")
+    print(f"Private Seeding Time Threshold: {analysis.get('seeding_time_threshold_days')} days")
     check_dirs = analysis.get('check_directories', [])
     if len(check_dirs) == 1:
         print(f"Check Directory: {check_dirs[0]}")
@@ -849,7 +935,11 @@ def print_results(analysis: Dict, verbose: bool = False) -> None:
         for result in ok_sorted:
             print(f"  ✓ [{result['torrent_id']}] {result['torrent_name']}")
             print(f"    Status: {result['status']}")
+            if result.get('is_private') is not None:
+                print(f"    Privacy: {'private' if result['is_private'] else 'public'}")
             print(f"    Added: {result['added_date']}")
+            if result.get('seeding_time_seconds') is not None:
+                print(f"    Seeding time: {result['seeding_time_seconds'] / 86400:.1f} days")
             print(f"    Seeds: {result['peer_count']}")
             print(f"    Files: {result['files_hardlinked']}/{result['files_checked']} hardlinked")
             if result.get('tracker_unavailable'):
@@ -868,8 +958,8 @@ def print_results(analysis: Dict, verbose: bool = False) -> None:
     reason_labels = {
         'missing_files': 'torrent data is missing from disk',
         'not_hardlinked_with_more_than_two_seeds': 'not hardlinked and has more than two seeds',
-        'only_hardlinked_to_old_torrents': 'only hardlinked to torrents older than the threshold',
-        'hardlinked_to_younger_torrent': 'hardlinked to a younger torrent',
+        'only_hardlinked_to_long_seeded_torrents': 'only hardlinked to torrents over the seeding-time threshold',
+        'hardlinked_to_public_shorter_seeded_or_unknown_torrent': 'hardlinked to a public torrent, a torrent below the seeding-time threshold, or a torrent with unknown seeding time',
     }
 
     # Keep tracker deletions visually separate from the hardlink policy.
@@ -889,8 +979,12 @@ def print_results(analysis: Dict, verbose: bool = False) -> None:
         for result in other_flagged_sorted:
             print(f"  ⚠️ [{result['torrent_id']}] {result['torrent_name']}")
             print(f"    Status: {result['status']}")
+            if result.get('is_private') is not None:
+                print(f"    Privacy: {'private' if result['is_private'] else 'public'}")
             print(f"    Deletion reason: {reason_labels.get(result.get('flag_reason'), result.get('flag_reason', 'cleanup rule'))}")
             print(f"    Added: {result['added_date']}")
+            if result.get('seeding_time_seconds') is not None:
+                print(f"    Seeding time: {result['seeding_time_seconds'] / 86400:.1f} days")
             print(f"    Seeds: {result['peer_count']}")
             print(f"    Files: {result['files_hardlinked']}/{result['files_checked']} hardlinked")
 
@@ -1029,6 +1123,10 @@ def main():
         
         # Setup logging
         setup_logging(config)
+        if 'seeding_time_threshold_days' not in config:
+            logging.warning(
+                "'age_threshold_days' is deprecated; it is now interpreted as a seeding-time threshold"
+            )
         logging.info("Starting Transmission hardlink checker...")
         
         # Initialize clients
@@ -1051,7 +1149,10 @@ def main():
         
         # Run analysis
         analyzer = TorrentAnalyzer(transmission, hardlink_checker)
-        analysis = analyzer.analyze(config['age_threshold_days'])
+        seeding_time_threshold_days = config.get(
+            'seeding_time_threshold_days', config.get('age_threshold_days')
+        )
+        analysis = analyzer.analyze(seeding_time_threshold_days)
         
         # Output results
         if args.json:

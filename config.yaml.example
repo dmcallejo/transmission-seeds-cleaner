@@ -6,9 +6,8 @@ transmission:
   username: "username"
   password: "password"
 
-# Age threshold for torrents (in days)
-# Torrents older than this will be checked
-age_threshold_days: 60
+# Private torrents must meet this accumulated seeding time before being checked (in days)
+seeding_time_threshold_days: 60
 
 # Directories where torrents are stored (filter which torrents to analyze)
 # Only torrents in these directories will be checked

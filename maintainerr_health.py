@@ -5,6 +5,9 @@ Maintainerr metadata health check.
 Maintainerr only logs metadata problems as warnings, and a title it cannot
 match is silently never cleaned up. This check finds:
 
+Only requested titles (Radarr/Sonarr tag "request") are reported, since the
+cleanup rules never touch anything else.
+
 1. Metadata mismatches from Maintainerr's log (default: last 2h, i.e. the latest rule run):
    - the media server's year disagrees with TMDB/TVDB, so provider IDs are rejected
    - external IDs could not be resolved, so no Radarr/Sonarr item was found
@@ -103,6 +106,8 @@ def scan_logs(container: str, since: str, arr_data, mappings) -> List[Dict]:
     out = subprocess.run(['docker', 'logs', '--since', since, container],
                          capture_output=True, text=True, timeout=120)
     text = out.stdout + out.stderr
+    # Only requested titles matter: the cleanup rules never touch anything else.
+    requested_titles = {norm(i['title']) for inst in arr_data for i in inst['items'] if i['requested']}
     arr_by_folder = {}
     for inst in arr_data:
         for item in inst['items']:
@@ -117,6 +122,8 @@ def scan_logs(container: str, since: str, arr_data, mappings) -> List[Dict]:
                 continue
             g = m.groupdict()
             title = g['title']
+            if kind in ('year_mismatch', 'unresolved') and norm(title) not in requested_titles:
+                break
             if kind == 'year_mismatch':
                 key = f"meta:{norm(title)}"
                 findings.setdefault(key, {'title': title, 'kind': 'metadata', 'msgs': set()})['msgs'].add(
@@ -133,7 +140,7 @@ def scan_logs(container: str, since: str, arr_data, mappings) -> List[Dict]:
                 hit = None
                 for candidate in (folder, str(Path(folder).parent)):
                     hit = arr_by_folder.get(candidate) or hit
-                if hit and norm(hit[1]['title']) != norm(title):
+                if hit and hit[1]['requested'] and norm(hit[1]['title']) != norm(title):
                     key = f"wrongmatch:{folder}"
                     findings[key] = {'title': hit[1]['title'], 'kind': 'metadata', 'msgs': {
                         f"Plex matched '{title}' ({g['ids']}) but {hit[0]['name']} has "

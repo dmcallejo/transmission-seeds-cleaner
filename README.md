@@ -42,6 +42,14 @@ list; folders are never scanned, because several torrents can share one folder
 name (cross-seed season packs all called `Season 1` end up in the same
 `cross-seed/<tracker>/Season 1/` folder).
 
+Only torrents sharing a file with what Plex **currently serves** tie into a
+Maintainerr item. When Radarr/Sonarr upgrade a release, the old download (and
+its cross-seeds) no longer shares any file with the library: it can't be
+watched, so it never holds back or follows Maintainerr's rules. It is handled
+only by the cleaner's seeding rule (its group is removed once every member has
+finished seeding). A partially upgraded season pack still shares the remaining
+episodes with Plex, so it keeps counting for that season.
+
 A torrent has **finished seeding** when it is complete and either public, or
 private with `secondsSeeding >= seeding_time_threshold_days`. Transmission's
 accumulated seeding time is used, not the time since it was added.
@@ -104,7 +112,8 @@ postponed; check the log after any failed run.
 
 Maintainerr only logs metadata problems as warnings, and a title it can't
 match is silently never cleaned up (it fails the "requested" check). This
-script reports:
+script reports, **for requested titles only** (Radarr/Sonarr tag `request`;
+nothing else is ever cleaned up, so nothing else is worth an alert):
 
 1. **Metadata mismatches** found in Maintainerr's log (default: the last 2
    hours, i.e. the latest rule run):

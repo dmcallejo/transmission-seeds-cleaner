@@ -149,6 +149,22 @@ def scan_logs(container: str, since: str, arr_data, mappings) -> List[Dict]:
     return list(findings.values())
 
 
+def other_library(maintainerr, lib_cache, covered, id_key, wanted, all_covered=frozenset()):
+    """Name of another Plex library holding this ID, if any."""
+    if 'all' not in lib_cache:
+        lib_cache['all'] = [l for l in maintainerr.get('/media-server/libraries')]
+    for lib in lib_cache['all']:
+        lib_id = str(lib.get('id'))
+        if lib_id in covered:
+            continue
+        if lib_id not in lib_cache:
+            lib_cache[lib_id] = maintainerr.library(lib_id)
+        for p in lib_cache[lib_id]:
+            if str(wanted) in [str(i) for i in (p.get('providerIds') or {}).get(id_key, [])]:
+                return lib.get('title', lib_id), lib_id in all_covered
+    return None
+
+
 def missing_requested(maintainerr: Maintainerr, arr_data) -> List[Dict]:
     findings = []
     collections = maintainerr.get('/collections')
@@ -176,6 +192,17 @@ def missing_requested(maintainerr: Maintainerr, arr_data) -> List[Dict]:
             if not (item['requested'] and item['hasFile']):
                 continue
             if str(item[id_key]) in ids:
+                continue
+            elsewhere = other_library(maintainerr, lib_cache, libs, id_key, item[id_key],
+                                      {l for ls in libs_by_arr.values() for l in ls})
+            if elsewhere and elsewhere[1]:
+                findings.append({'title': f"{item['title']} ({item['year']})", 'kind': 'missing', 'msgs': {
+                    f"requested in {inst['name']}, but Plex only has it in '{elsewhere[0]}' "
+                    f"(no copy in the library {inst['name']}'s rule covers)"}})
+                continue
+            if elsewhere:
+                findings.append({'title': f"{item['title']} ({item['year']})", 'kind': 'uncovered', 'msgs': {
+                    f"in Plex library '{elsewhere[0]}', which no Maintainerr rule covers"}})
                 continue
             same = by_title.get(norm(item['title']))
             if same:
@@ -263,6 +290,7 @@ def main():
     elif due:
         meta = [f for f in findings if f['kind'] == 'metadata']
         missing = [f for f in findings if f['kind'] == 'missing']
+        uncovered = [f for f in findings if f['kind'] == 'uncovered']
         lines = [f"⚠️ <b>Maintainerr</b>: {len(findings)} title(s) can't be evaluated by the cleanup rules"
                  + ("" if changed else " (reminder, unchanged)")]
         if meta:
@@ -271,6 +299,9 @@ def main():
         if missing:
             lines.append("\n<b>Requested but not matched in Plex</b>:")
             lines += [f"• {html(f['title'])}: {html('; '.join(sorted(f['msgs'])))}" for f in missing]
+        if uncovered:
+            lines.append("\n<b>Requested, but in a library with no Maintainerr rule</b> (never cleaned up):")
+            lines += [f"• {html(f['title'])}: {html('; '.join(sorted(f['msgs'])))}" for f in uncovered]
         lines.append("\nAfter fixing in Plex, restart Maintainerr to drop its metadata cache.")
         text = '\n'.join(lines)[:4000]
         if args.dry_run:

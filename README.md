@@ -6,6 +6,7 @@ from wasting disk space, without breaking private-tracker seeding rules:
 | Script | What it does | When |
 |---|---|---|
 | `maintainerr_gate.py` | Holds back [Maintainerr](https://github.com/Maintainerr/Maintainerr) deletions while any torrent that shares the item's files still has to seed. | Daily, **before** Maintainerr's collection job |
+| `maintainerr_health.py` | Finds titles Maintainerr can't evaluate (Plex metadata mismatches, requested titles missing from Plex) and reports them on Telegram. | Daily, **after** Maintainerr's rules job |
 | `torrent_checker.py` | Removes torrents that are no longer in the library once every torrent sharing their files has seeded long enough. Also removes torrents the tracker has deleted and re-verifies corrupt ones. | Daily, **after** Maintainerr's collection job |
 
 The idea: a file only frees disk space when **every** hardlink to it is gone
@@ -20,6 +21,7 @@ deleting a torrent early breaks tracker rules. So both tools reason about
 03:50  maintainerr_gate.py   postpone due items whose torrent group still seeds
 04:05  Maintainerr           deletes due items (Radarr/Sonarr + original torrent)
 05:05  Maintainerr           re-evaluates rules, queues new items
+05:40  maintainerr_health.py reports titles the rules couldn't evaluate
 06:30  torrent_checker.py    removes leftover torrent groups (e.g. cross-seeds)
 ```
 
@@ -98,6 +100,44 @@ postponed; check the log after any failed run.
 .venv/bin/python maintainerr_gate.py                   # postpone for real (cron)
 ```
 
+## `maintainerr_health.py`: metadata health check
+
+Maintainerr only logs metadata problems as warnings, and a title it can't
+match is silently never cleaned up (it fails the "requested" check). This
+script reports:
+
+1. **Metadata mismatches** found in Maintainerr's log (default: the last 2
+   hours, i.e. the latest rule run):
+   - Plex's year (taken from *Originally Available*) disagrees with TMDB/TVDB, so
+     Maintainerr rejects the provider IDs;
+   - no Radarr/Sonarr item could be identified;
+   - Plex matched a different title than the Radarr/Sonarr item stored in the
+     same folder. Untracked titles (added outside Radarr/Sonarr) are ignored.
+2. **Requested titles missing from Plex**: every Radarr/Sonarr item tagged
+   `request` with files must have a Plex item (by TMDB/TVDB ID) in the library
+   that instance's Maintainerr rule covers.
+
+Results go to Telegram using the bot and chat configured in Maintainerr
+(**Settings → Notifications**). A message is sent when the set of issues
+changes, as a weekly reminder while issues remain, and once as an all-clear.
+State lives in `.maintainerr_health_state.json`.
+
+Radarr/Sonarr are usually only reachable inside Docker, so the script reads
+them by running a small Node snippet in the Maintainerr container
+(`docker exec`, using the instances configured in Maintainerr). The user
+running it must be allowed to use `docker`.
+
+```bash
+.venv/bin/python maintainerr_health.py --dry-run            # print the message
+.venv/bin/python maintainerr_health.py --dry-run --since 24h
+.venv/bin/python maintainerr_health.py --force              # send even if unchanged
+```
+
+Fixing what it reports: correct the match in Plex (*Fix Match…*, or set
+*Originally Available* to the right date and lock it), then **restart
+Maintainerr**, which caches media-server metadata in memory. Titles you accept as
+they are can be silenced with `maintainerr.health.ignore`.
+
 ## Maintainerr rules
 
 The gate does not decide *what* to delete; Maintainerr's rules do. The setup
@@ -161,6 +201,9 @@ See `config.yaml.example`. Key settings:
 | `maintainerr.url` | Maintainerr base URL (gate only) |
 | `maintainerr.path_mappings` | Prefix map from the paths Plex reports to host paths, e.g. `"/mnt/storage/": "/media/"` |
 | `maintainerr.log_file` | Gate log file name (in `logging.dir`) |
+| `maintainerr.health.container` | Maintainerr container name (default `maintainerr`) |
+| `maintainerr.health.ignore` | Titles the health check should never report |
+| `maintainerr.health.log_file` | Health check log file name (default `maintainerr_health.log`) |
 | `logging.*` | See [Logging and debugging](#logging-and-debugging) |
 
 ## Scheduling (cron)
@@ -170,8 +213,12 @@ Maintainerr's collection job at 04:05 and rules job at 05:05:
 
 ```cron
 50 3 * * * cd /home/USER/transmission-seeds-cleaner && flock -n /tmp/seeds-cleaner.lock .venv/bin/python maintainerr_gate.py >/dev/null
+40 5 * * * cd /home/USER/transmission-seeds-cleaner && .venv/bin/python maintainerr_health.py >/dev/null
 30 6 * * * cd /home/USER/transmission-seeds-cleaner && flock -w 3600 /tmp/seeds-cleaner.lock .venv/bin/python torrent_checker.py --yes >/dev/null
 ```
+
+Run the health check within 2 hours after Maintainerr's rules job (or pass a
+matching `--since`).
 
 If you change Maintainerr's job times, keep the gate **before** the collection
 job.
@@ -187,7 +234,8 @@ logging:
   retention_days: 30      # files rotate at midnight
 ```
 
-Files: `logs/torrent_checker.log` and `logs/maintainerr_gate.log` (plus dated
+Files: `logs/torrent_checker.log`, `logs/maintainerr_gate.log` and
+`logs/maintainerr_health.log` (plus dated
 rotations). Every line carries a run ID (`[YYYYMMDD-HHMMSS-PID]`), so one run
 can be isolated with `grep`.
 
@@ -224,6 +272,8 @@ Common issues:
 |---|---|
 | Gate: `none of its N file(s) found on disk` | `path_mappings` doesn't match how Plex sees the library |
 | Gate: `torrent index unavailable` | Transmission RPC down or wrong credentials |
+| A requested title is never flagged | Run `maintainerr_health.py --dry-run --since 24h`; usually a Plex match/date problem |
+| Fixed a match in Plex but Maintainerr still sees the old data | Restart Maintainerr (in-memory metadata cache) |
 | Item postponed every 7 days forever | A private torrent in its group is paused; resume or remove it |
 | Cleaner keeps a group forever | A member never completes (partial cross-seed, stalled download); see `waiting_on=` |
 | Cleaner: `has none of its N files on disk` | Data was removed outside Transmission; the torrent is removed (`missing_files`) |

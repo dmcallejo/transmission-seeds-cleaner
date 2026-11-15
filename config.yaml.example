@@ -28,6 +28,10 @@ maintainerr:
   path_mappings:
     "/mnt/storage/": "/media/"
   log_file: "maintainerr_gate.log"
+  # Metadata health check (maintainerr_health.py)
+  health:
+    container: "maintainerr"
+    ignore: []              # titles never to report, e.g. ["Initial D Extra Stage"]
 
 # Logging (both scripts). Files rotate at midnight.
 logging:

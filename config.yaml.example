@@ -1,4 +1,4 @@
-# Transmission Hardlink Checker Configuration
+# Transmission Seeds Cleaner configuration (used by both scripts)
 
 # Transmission server settings
 transmission:
@@ -6,23 +6,33 @@ transmission:
   username: "username"
   password: "password"
 
-# Private torrents must meet this accumulated seeding time before being checked (in days)
-seeding_time_threshold_days: 60
+# Private torrents must have seeded at least this long (accumulated seeding
+# time reported by Transmission) before they or their group can be removed.
+seeding_time_threshold_days: 90
 
-# Directories where torrents are stored (filter which torrents to analyze)
-# Only torrents in these directories will be checked
+# Directories where torrents are stored (filter which torrents to manage).
+# Only torrents downloading into these directories are considered.
 torrent_directories:
   - "/path/to/torrent/storage1"
   - "/path/to/torrent/storage2"
-  # Add more directories as needed
 
-# Directories to check for hardlinks (where to verify files are hardlinked)
+# Library directories. A torrent whose files are hardlinked here is "in the library".
 check_directories:
-  - "/path/to/check/directory1"
-  - "/path/to/check/directory2"
-  # Add more directories as needed
+  - "/path/to/library/Movies"
+  - "/path/to/library/TV Shows"
 
-# Optional: Logging settings
+# Maintainerr deletion gate (maintainerr_gate.py)
+maintainerr:
+  url: "http://localhost:6246"
+  # Map the paths Plex reports to paths on this host.
+  path_mappings:
+    "/mnt/storage/": "/media/"
+  log_file: "maintainerr_gate.log"
+
+# Logging (both scripts). Files rotate at midnight.
 logging:
-  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  dir: "logs"
   file: "torrent_checker.log"
+  level: "DEBUG"          # DEBUG, INFO, WARNING, ERROR (written to files)
+  console_level: "INFO"   # printed to stdout
+  retention_days: 30

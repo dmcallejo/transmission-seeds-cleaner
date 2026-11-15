@@ -1,194 +1,230 @@
 # Transmission Seeds Cleaner
 
-A Python utility for identifying seeding torrents in Transmission that have seeded longer than a specified threshold and checking if their files are hardlinked to a target directory or other torrents.
+Two cooperating tools that keep a Plex + *arr + Transmission (+ cross-seed) box
+from wasting disk space, without breaking private-tracker seeding rules:
 
-## Features
+| Script | What it does | When |
+|---|---|---|
+| `maintainerr_gate.py` | Holds back [Maintainerr](https://github.com/Maintainerr/Maintainerr) deletions while any torrent that shares the item's files still has to seed. | Daily, **before** Maintainerr's collection job |
+| `torrent_checker.py` | Removes torrents that are no longer in the library once every torrent sharing their files has seeded long enough. Also removes torrents the tracker has deleted and re-verifies corrupt ones. | Daily, **after** Maintainerr's collection job |
 
-- Connects to a Transmission instance via RPC (supports HTTP and HTTPS)
-- Identifies seeding torrents that meet a configurable accumulated seeding-time threshold
-- Detects torrents whose tracker definitively reports them as unregistered
-- Triggers Transmission data verification for torrents reporting corrupt data
-- Checks if torrent files are hardlinked to target directories
-- Detects hardlinks between torrents and identifies relationship chains
-- Intelligent flagging logic: only flags torrents that need cleanup
-- Interactive torrent deletion with confirmation
-- Accurate disk space calculation accounting for hardlinked files
-- Generates detailed reports in both human-readable and JSON formats
-- Comprehensive logging with timestamps
-- Support for multiple torrent and target directories
+The idea: a file only frees disk space when **every** hardlink to it is gone
+(library copy, original download, every cross-seed copy). Deleting the Plex copy
+while a torrent must keep seeding frees nothing and loses the title, and
+deleting a torrent early breaks tracker rules. So both tools reason about
+**groups of torrents that share files** and act only when the whole group is done.
+
+## How the pieces fit together
+
+```
+03:50  maintainerr_gate.py   postpone due items whose torrent group still seeds
+04:05  Maintainerr           deletes due items (Radarr/Sonarr + original torrent)
+05:05  Maintainerr           re-evaluates rules, queues new items
+06:30  torrent_checker.py    removes leftover torrent groups (e.g. cross-seeds)
+```
+
+1. **Maintainerr rules** decide *what* should go (see [Maintainerr rules](#maintainerr-rules)).
+2. **The gate** decides *when*: an item due for deletion is postponed until the
+   last torrent sharing its files has met the seeding threshold.
+3. **Maintainerr** deletes the media and (via its download-client integration)
+   the original torrent.
+4. **The cleaner** removes the remaining cross-seed torrents of that group,
+   which frees the space.
+
+## Torrent groups
+
+Torrents are grouped when they share any file on disk, either by hardlink
+(cross-seed `linkType: hardlink`, *arr imports) or because two torrents point
+at the very same path. Each torrent's files come from Transmission's own file
+list; folders are never scanned, because several torrents can share one folder
+name (cross-seed season packs all called `Season 1` end up in the same
+`cross-seed/<tracker>/Season 1/` folder).
+
+A torrent has **finished seeding** when it is complete and either public, or
+private with `secondsSeeding >= seeding_time_threshold_days`. Transmission's
+accumulated seeding time is used, not the time since it was added.
+
+## `torrent_checker.py`: cleanup rules
+
+For every group with at least one torrent inside `torrent_directories`:
+
+| Situation | Decision | `flag_reason` |
+|---|---|---|
+| Any member's files are in the library (`check_directories`) | keep | `group_linked_to_library` |
+| Any member has not finished seeding | keep, report blockers | `group_member_below_threshold` |
+| Single torrent, files gone from disk | delete | `missing_files` |
+| Single torrent, >2 seeds on tracker | delete | `not_hardlinked_with_more_than_two_seeds` |
+| Single torrent, ≤2 seeds | keep (don't kill a rare release) | `two_or_fewer_seeds` |
+| Several torrents, all finished seeding | delete the **whole group** | `cross_seed_group_all_seeded` |
+| Tracker says the torrent is unregistered/deleted | delete that torrent | `tracker_unavailable` |
+
+Data is deleted together with the torrent, **except** when a torrent that is
+being kept points at the same path. Then only the torrent is removed
+(`delete_data=False`). Removing one hardlink never affects the others.
+
+```bash
+.venv/bin/python torrent_checker.py            # report, then ask before deleting
+.venv/bin/python torrent_checker.py --verbose  # also list kept torrents
+.venv/bin/python torrent_checker.py --json     # machine-readable report, never deletes
+.venv/bin/python torrent_checker.py --yes      # delete flagged torrents unattended (cron)
+```
+
+## `maintainerr_gate.py`: deletion gate
+
+For every item in an active Maintainerr collection that is due within
+`--lookahead-hours` (default 24):
+
+1. Get the item's file paths from Maintainerr (`/api/media-server/meta/:id`, plus
+   episodes for seasons/shows) and translate them with `path_mappings`.
+2. Find every torrent that shares those files, and the full group of each.
+3. If any member hasn't finished seeding, call Maintainerr's
+   `POST /api/collections/media/postpone` so the item is deleted when the
+   slowest member is done (`ceil(days left)`).
+   - Paused/stopped torrents don't accumulate seeding time: re-checked every 7 days.
+4. Otherwise do nothing; Maintainerr deletes it at its next collection run.
+
+Fail-safe behaviour (an item is never deleted unchecked):
+
+- None of the item's files exist on disk (wrong `path_mappings`?): postpone 1 day.
+- Transmission is unreachable: every due item is postponed 1 day.
+- Any error while checking an item: that item is postponed 1 day.
+
+If the gate itself cannot run (e.g. Maintainerr's API is down), nothing is
+postponed; check the log after any failed run.
+
+```bash
+.venv/bin/python maintainerr_gate.py --dry-run --all   # what would happen to every item
+.venv/bin/python maintainerr_gate.py --dry-run         # only items due in the next 24h
+.venv/bin/python maintainerr_gate.py                   # postpone for real (cron)
+```
+
+## Maintainerr rules
+
+The gate does not decide *what* to delete; Maintainerr's rules do. The setup
+this was built for only cleans up **requested** content (anything added
+manually is kept):
+
+```
+requested (Radarr/Sonarr tag "request", or "Requested in Seerr")
+AND (
+      the requester watched it         movie: "Viewed by" contains the requester
+                                       season: requester watched every episode
+   OR no play at all for 60 days        Tautulli "Last play date (including unfinished)"
+                                       older than 60 days, or never played and
+                                       added > 60 days ago
+                                       (only for releases older than 1 year)
+   OR no play at all for 90 days        same, any release age
+                                       (so releases from the last year get 90 days)
+)
+```
+
+Notes for building such rules in Maintainerr:
+
+- Use **Tautulli → Last play date (including unfinished)**. Plex's "Last view
+  date" only counts finished views, so a partly watched movie looks idle.
+- Inside one section Maintainerr evaluates rules strictly left to right (no
+  AND-before-OR precedence). Put each `A AND B` clause in its own section and
+  join sections with `OR`.
+- Use **Not exists** on the last-play date to catch never-played items.
+- With the gate in place, the collection's "delete after" can be 1 day: the
+  seeding threshold, not a grace period, is what keeps files around.
+- Tag anything you want to protect with the exclusion tag (`dnd`) and enable
+  tag exclusions in Maintainerr's Radarr/Sonarr settings.
+
+## Installation
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp config.yaml.example config.yaml   # then edit
+```
+
+The user running the scripts needs read access to all torrent and library
+directories (inode lookups). Deletions go through Transmission RPC.
+
+## Configuration
+
+See `config.yaml.example`. Key settings:
+
+| Key | Meaning |
+|---|---|
+| `transmission.url/username/password` | Transmission RPC |
+| `seeding_time_threshold_days` | Minimum accumulated seeding time for private torrents (e.g. 90). `age_threshold_days` is accepted as a deprecated alias. |
+| `torrent_directories` | Only torrents downloading into these are managed |
+| `check_directories` | Library folders; files hardlinked here are "in the library" |
+| `maintainerr.url` | Maintainerr base URL (gate only) |
+| `maintainerr.path_mappings` | Prefix map from the paths Plex reports to host paths, e.g. `"/mnt/storage/": "/media/"` |
+| `maintainerr.log_file` | Gate log file name (in `logging.dir`) |
+| `logging.*` | See [Logging and debugging](#logging-and-debugging) |
+
+## Scheduling (cron)
+
+Both scripts share a lock so they never run at the same time. Times assume
+Maintainerr's collection job at 04:05 and rules job at 05:05:
+
+```cron
+50 3 * * * cd /home/USER/transmission-seeds-cleaner && flock -n /tmp/seeds-cleaner.lock .venv/bin/python maintainerr_gate.py >/dev/null
+30 6 * * * cd /home/USER/transmission-seeds-cleaner && flock -w 3600 /tmp/seeds-cleaner.lock .venv/bin/python torrent_checker.py --yes >/dev/null
+```
+
+If you change Maintainerr's job times, keep the gate **before** the collection
+job.
+
+## Logging and debugging
+
+```yaml
+logging:
+  dir: "logs"             # relative to the working directory
+  file: "torrent_checker.log"
+  level: "DEBUG"          # detail written to the files
+  console_level: "INFO"   # detail printed to stdout
+  retention_days: 30      # files rotate at midnight
+```
+
+Files: `logs/torrent_checker.log` and `logs/maintainerr_gate.log` (plus dated
+rotations). Every line carries a run ID (`[YYYYMMDD-HHMMSS-PID]`), so one run
+can be isolated with `grep`.
+
+What gets logged:
+
+- **Gate:** start/end with a summary (`checked`, `released`, `postponed`,
+  `unverifiable`, `errors`), one `POSTPONE` / `RELEASE` line per due item with
+  the reason, the new Maintainerr deletion date, and at DEBUG every file path
+  (Plex path → host path, `[MISSING]` marker) and every linked torrent with
+  privacy, status, seeding time and files present.
+- **Cleaner:** index size, counts per decision, one `FLAG` line per torrent to
+  delete (reason, `delete_data`, size, group members), at DEBUG one `keep` line
+  per kept torrent with the members it is waiting on, warnings for torrents
+  whose files are missing, and the deletion outcome with expected freed space.
+
+Useful queries:
+
+```bash
+# Last gate run summary
+grep "maintainerr_gate done" logs/maintainerr_gate.log | tail -1
+# Why is <title> still in Plex / when will it go?
+grep -i "<title>" logs/maintainerr_gate.log | tail
+# Why was torrent #123 deleted (or kept)?
+grep "#123 " logs/torrent_checker.log | tail
+# Everything from one run
+grep "20261116-035001-12345" logs/*.log
+# Problems only
+grep -E "WARNING|ERROR" logs/*.log
+```
+
+Common issues:
+
+| Symptom | Likely cause |
+|---|---|
+| Gate: `none of its N file(s) found on disk` | `path_mappings` doesn't match how Plex sees the library |
+| Gate: `torrent index unavailable` | Transmission RPC down or wrong credentials |
+| Item postponed every 7 days forever | A private torrent in its group is paused; resume or remove it |
+| Cleaner keeps a group forever | A member never completes (partial cross-seed, stalled download); see `waiting_on=` |
+| Cleaner: `has none of its N files on disk` | Data was removed outside Transmission; the torrent is removed (`missing_files`) |
 
 ## Requirements
 
 - Python 3.8+
-- Access to a Transmission instance with RPC enabled
-- `transmission-rpc` Python package (see requirements.txt)
-
-## Installation
-
-1. Clone or download this repository
-2. Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-## Configuration
-
-Edit `config.yaml` with your settings:
-
-```yaml
-transmission:
-  url: "https://your-seedbox.com/transmission/"  # Supports HTTP and HTTPS
-  username: "your-username"
-  password: "your-password"
-
-# Minimum accumulated seeding time required before checking torrents (in days)
-seeding_time_threshold_days: 60
-
-# Directories where torrents are stored (used to FILTER which torrents to analyze)
-torrent_directories:
-  - "/mnt/storage/torrents"
-
-# Directories to check for hardlinks (where to verify files are hardlinked)
-check_directories:
-  - "/mnt/storage/Movies"
-  - "/mnt/storage/TV"
-
-# Logging configuration
-logging:
-  level: "INFO"
-  file: "torrent_checker.log"
-```
-
-Alternatively, you can use the legacy single directory format:
-
-```yaml
-check_directory: "/path/to/download/directory"
-torrent_directory: "/path/to/torrent/storage"
-```
-
-### Configuration Parameters
-
-- **transmission.url**: URL to your Transmission RPC interface (supports HTTP and HTTPS with standard ports 80/443)
-- **transmission.username**: Transmission username
-- **transmission.password**: Transmission password
-- **seeding_time_threshold_days**: Minimum accumulated seeding duration in days required for private torrents before they are checked; public torrents bypass this threshold
-- **torrent_directories**: List of directories where torrents are stored. Only torrents in these directories will be analyzed
-- **torrent_directory** (legacy): Single directory where torrents are stored
-- **check_directories**: List of directories to check for hardlinks. These are the target directories where hardlinked files should exist
-- **check_directory** (legacy): Single directory to check for hardlinks
-- **logging.level**: Logging verbosity level (DEBUG, INFO, WARNING, ERROR)
-- **logging.file**: Path to log file
-
-When Transmission reports a current corruption error, the script queues a data verification. Historical `corruptEver` values alone do not trigger verification because that field is cumulative. Torrents already being checked are skipped, and all requested verifications are sent in one RPC call.
-
-Transmission's reported `seconds_seeding` value is used for this filter, so time spent downloading before a torrent completes does not count. Public torrents bypass the threshold; private torrents must meet it. If Transmission does not report whether a torrent is private, the checker applies the threshold. Existing configurations can keep `age_threshold_days`; it is accepted as a deprecated alias, but now means minimum seeding time rather than time since the torrent was added.
-
-## Usage
-
-Run the checker with default configuration file:
-
-```bash
-python torrent_checker.py
-```
-
-Specify a custom configuration file:
-
-```bash
-python torrent_checker.py -c /path/to/custom_config.yaml
-```
-
-Output results as JSON:
-
-```bash
-python torrent_checker.py --json
-```
-
-Show details for healthy torrents as well as flagged torrents:
-
-```bash
-python torrent_checker.py --verbose
-```
-
-## Output
-
-### Human-Readable Report
-
-The tool produces a detailed report showing:
-- **OK torrents** (✓): Properly hardlinked to target directories or linked to public torrents/private torrents below the seeding-time threshold
-- **Tracker-unavailable torrents to delete** (🗑️): The tracker explicitly reports that the torrent is no longer registered
-- **Other flagged torrents to delete** (⚠️): Candidates selected by the hardlink cleanup rules, with the deletion reason shown
-- Hardlink status with torrent relationships
-- Accumulated seeding time reported by Transmission
-- Seed count from tracker
-- File hardlink statistics
-
-After analysis, you'll be prompted to optionally delete flagged torrents with:
-- Summary of torrents and files to be removed
-- **Actual disk space calculation** based on files and hardlink counts currently present on disk
-- Confirmation prompt before any deletion
-
-### JSON Output
-
-Use `--json` flag to get machine-readable JSON output suitable for scripting:
-
-```bash
-python torrent_checker.py --json > report.json
-```
-
-## Understanding the Status Values
-
-- **hardlinked_to_target**: Files are hardlinked into the target check directory
-- **hardlinked_to_other_torrents**: Files are hardlinked to other locations (likely other torrents)
-- **not_hardlinked**: Files have no hardlinks; they are unique to this torrent
-- **directory_not_found**: Torrent download directory doesn't exist
-- **no_files_found**: No files found in the torrent directory
-- **tracker_unavailable**: All reported trackers definitively rejected the torrent; it is eligible for deletion
-
-## Flagged Torrents
-
-Torrents are flagged (⚠️) if:
-1. They are NOT hardlinked to the target directory AND
-2. AND either:
-   - They have NO hardlinks at all, AND have more than 2 seeds
-   - OR all identified hardlinks are ONLY to private torrents that have also met the seeding-time threshold
-
-Torrents are OK (✓) if:
-- They ARE hardlinked to target directories
-- OR they are hardlinked to public torrents, or to private torrents below the threshold or with unknown seeding time
-
-A detected hardlink still prevents the "more than two seeds" rule from treating a torrent as completely unlinked, even when the linked path belongs to a torrent outside the seeding-time-filtered analysis set. The long-seeding rule applies when linked torrents are identified and all are private torrents that have met the threshold.
-
-This logic avoids deleting torrents that are still being used as sources for public torrents or private torrents with less accumulated seeding time.
-
-Torrents that are no longer registered at their tracker are also flagged, regardless of age or seeding status. Temporary tracker errors such as timeouts or connection failures do not qualify, and a successful response from any tracker keeps the torrent out of this category. These torrents are limited to the configured torrent directories and are removed from Transmission with their local data after confirmation.
-
-Hardlinked torrents can still be flagged when they are linked only to private torrents that have met the configured seeding-time threshold. The report labels these separately as `only_hardlinked_to_long_seeded_torrents`; this is part of the existing cleanup policy and is distinct from tracker-unavailable deletion.
-
-## Logging
-
-By default, logs are written to `torrent_checker.log` and printed to stdout. Adjust the logging level in `config.yaml` for more or less verbose output:
-
-- **DEBUG**: Very detailed information for troubleshooting
-- **INFO**: General information about progress (default)
-- **WARNING**: Only important notices
-- **ERROR**: Only errors
-
-## Troubleshooting
-
-### Connection Issues
-
-- Verify Transmission RPC is enabled in Transmission settings
-- Check credentials in config.yaml
-- Ensure the URL and port are correct
-
-### Permission Errors
-
-- The user running this script must have read access to torrent download directories
-- Use `sudo` if necessary, but ensure file permissions allow it
-
-### No Torrents Found
-
-- Check that torrents are actually seeding
-- Verify `seeding_time_threshold_days` is set appropriately
-- Check Transmission logs for issues
+- `transmission-rpc`, `pyyaml`, `requests` (see `requirements.txt`)
+- A filesystem with inode/hardlink support
+- For the gate: Maintainerr with the media server configured

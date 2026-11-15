@@ -5,7 +5,7 @@ This project implements a Python utility for monitoring Transmission torrent har
 ## Project Overview
 
 - **Language**: Python 3.8+
-- **Purpose**: Monitor seeding torrents older than a threshold and check hardlink status
+- **Purpose**: Remove torrents (and gate Maintainerr deletions) only once every torrent sharing the same files has met the private-tracker seeding threshold
 - **Key Components**: Transmission RPC client integration, hardlink detection, configuration management
 
 ## Development Guidelines
@@ -22,8 +22,12 @@ When adding features:
 
 - `ConfigLoader`: Handles YAML configuration loading and validation
 - `TransmissionClient`: Wraps Transmission RPC functionality
-- `HardlinkChecker`: Detects hardlinks between files and directories
-- `TorrentAnalyzer`: Coordinates analysis and produces reports
+- `TorrentLinkIndex`: Exact per-torrent file lists (from Transmission, never folder scans), inode index, and union-find groups of torrents sharing files; seeding-done checks
+- `TorrentAnalyzer`: Applies the group cleanup rules and produces reports
+- `maintainerr_gate.py`: Postpones due Maintainerr items while their torrent group still has to seed
+- `setup_logging`: Daily-rotated log files in `logs/` with a per-run ID
+
+Always reason about groups: never delete data that another kept torrent uses, and never treat a torrent as unlinked just because its partner is outside the analysed set.
 
 ### Testing
 

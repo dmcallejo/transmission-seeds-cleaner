@@ -35,6 +35,10 @@ env/
 
 # Logs
 *.log
+logs/
+
+# Runtime state
+.torrent_verification_state.json
 
 # Config with credentials
 config.yaml

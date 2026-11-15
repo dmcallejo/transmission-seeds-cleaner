@@ -109,6 +109,8 @@ requested (Radarr/Sonarr tag "request", or "Requested in Seerr")
 AND (
       the requester watched it         movie: "Viewed by" contains the requester
                                        season: requester watched every episode
+        AND nobody played it for 30 days (grace period after watching;
+                                       a rewatch or partial play restarts it)
    OR no play at all for 60 days        Tautulli "Last play date (including unfinished)"
                                        older than 60 days, or never played and
                                        added > 60 days ago
@@ -127,7 +129,11 @@ Notes for building such rules in Maintainerr:
   join sections with `OR`.
 - Use **Not exists** on the last-play date to catch never-played items.
 - With the gate in place, the collection's "delete after" can be 1 day: the
-  seeding threshold, not a grace period, is what keeps files around.
+  seeding threshold, not a grace period, is what keeps files around. Grace
+  periods belong in the rules instead (like the 30 days after the requester
+  watched), so they only apply where intended and react to new plays.
+- Items without Tautulli history (e.g. marked watched by hand) never match the
+  "requester watched" clause; they fall under the "never played" clauses.
 - Tag anything you want to protect with the exclusion tag (`dnd`) and enable
   tag exclusions in Maintainerr's Radarr/Sonarr settings.
 

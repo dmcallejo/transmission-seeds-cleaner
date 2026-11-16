@@ -79,6 +79,30 @@ being kept points at the same path. Then only the torrent is removed
 .venv/bin/python torrent_checker.py --yes      # delete flagged torrents unattended (cron)
 ```
 
+### Duplicate copies (`dedupe.py`)
+
+At the end of each run the cleaner looks for torrent files that are separate
+**copies** of another file instead of hardlinks (e.g. cross-seed downloaded
+data it could have linked, or Sonarr re-imported an episode as a copy). Those
+waste the full file size.
+
+- Candidates: files of at least `dedupe.min_size_mb` on the same filesystem,
+  same size, same sampled hash (start/middle/end), at least one owned by a torrent.
+- Confirmed only when a **full SHA-256** of both files matches. Full hashes
+  are cached in `.dedupe_hash_cache.json` by device/inode/size/mtime.
+- Report only by default: one `DUPLICATE` line per group with the copy to keep
+  and the paths to replace.
+- With `dedupe.relink: true` (or `--relink`), each duplicate path is replaced
+  atomically by a hardlink to the kept copy (library copy first, then the inode
+  with most links, then a non-cross-seed download). Torrents using a replaced
+  path are paused during the swap, resumed if they were running, and queued for
+  a Transmission re-check.
+
+```bash
+.venv/bin/python torrent_checker.py --relink     # fix duplicates this run
+.venv/bin/python torrent_checker.py --no-dedupe  # skip the check
+```
+
 ## `maintainerr_gate.py`: deletion gate
 
 For every item in an active Maintainerr collection that is due within
@@ -213,6 +237,9 @@ See `config.yaml.example`. Key settings:
 | `maintainerr.health.container` | Maintainerr container name (default `maintainerr`) |
 | `maintainerr.health.ignore` | Titles the health check should never report |
 | `maintainerr.health.log_file` | Health check log file name (default `maintainerr_health.log`) |
+| `dedupe.enabled` | Run the duplicate-copy check at the end of the cleaner |
+| `dedupe.min_size_mb` | Ignore files smaller than this (default 50) |
+| `dedupe.relink` | Replace confirmed duplicates with hardlinks automatically (default false) |
 | `logging.*` | See [Logging and debugging](#logging-and-debugging) |
 
 ## Scheduling (cron)
@@ -255,6 +282,8 @@ What gets logged:
   the reason, the new Maintainerr deletion date, and at DEBUG every file path
   (Plex path → host path, `[MISSING]` marker) and every linked torrent with
   privacy, status, seeding time and files present.
+- **Dedupe:** groups found and recoverable space, one `DUPLICATE` line per
+  group (sha256 prefix, kept copy) with `replace` lines, and each relink.
 - **Cleaner:** index size, counts per decision, one `FLAG` line per torrent to
   delete (reason, `delete_data`, size, group members), at DEBUG one `keep` line
   per kept torrent with the members it is waiting on, warnings for torrents

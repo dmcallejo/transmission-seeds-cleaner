@@ -33,6 +33,12 @@ maintainerr:
     container: "maintainerr"
     ignore: []              # titles never to report, e.g. ["Initial D Extra Stage"]
 
+# Duplicate-copy check at the end of torrent_checker.py
+dedupe:
+  enabled: true
+  min_size_mb: 50
+  relink: false          # true = replace confirmed duplicates with hardlinks
+
 # Logging (both scripts). Files rotate at midnight.
 logging:
   dir: "logs"

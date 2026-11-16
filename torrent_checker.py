@@ -1076,6 +1076,16 @@ def main():
     )
     
     parser.add_argument(
+        '--relink',
+        action='store_true',
+        help='Replace duplicate copies with hardlinks this run (overrides dedupe.relink)'
+    )
+    parser.add_argument(
+        '--no-dedupe',
+        action='store_true',
+        help='Skip the duplicate-copy check this run'
+    )
+    parser.add_argument(
         '-y', '--yes',
         action='store_true',
         help='Delete flagged torrents without prompting (for cron)'
@@ -1139,6 +1149,23 @@ def main():
                 verification_count=analysis.get('corrupt_torrents_verified', 0),
             )
         
+        # Duplicate copies that could be hardlinks (after deletions, so removed
+        # torrents are not considered). Report-only unless relinking is enabled.
+        if not args.no_dedupe and not args.json:
+            import dedupe
+            try:
+                dedupe.run(
+                    transmission, config,
+                    lambda: TorrentLinkIndex(
+                        transmission, transmission.get_all_torrents(),
+                        check_dirs, torrent_dirs, seeding_time_threshold_days,
+                    ),
+                    relink_override=True if args.relink else None,
+                )
+            except Exception as e:
+                logging.error("dedupe failed: %s", e)
+                logging.debug("Traceback:", exc_info=True)
+
         logging.info("=== torrent_checker done ===")
         
     except (FileNotFoundError, ValueError, Exception) as e:

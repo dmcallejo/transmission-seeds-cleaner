@@ -48,3 +48,4 @@ config.yaml
 Thumbs.db
 
 .maintainerr_health_state.json
+.dedupe_hash_cache.json

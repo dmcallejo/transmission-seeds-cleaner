@@ -39,6 +39,10 @@ dedupe:
   min_size_mb: 50
   relink: false          # true = replace confirmed duplicates with hardlinks
 
+# Telegram summary of the cleaner's changes (bot/chat from Maintainerr)
+notify:
+  enabled: true
+
 # Logging (both scripts). Files rotate at midnight.
 logging:
   dir: "logs"

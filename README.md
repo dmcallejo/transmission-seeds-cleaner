@@ -103,6 +103,19 @@ waste the full file size.
 .venv/bin/python torrent_checker.py --no-dedupe  # skip the check
 ```
 
+### Telegram summary
+
+With `notify.enabled: true`, each cleaner run that changed something sends
+**one** Telegram message (via the bot/chat configured in Maintainerr, see
+`notify.py`) covering both tasks:
+
+- space actually freed (free-space difference before/after the run);
+- every torrent deleted: id, name, size, reason, and whether its data was kept;
+- every duplicate replaced by a hardlink: file, size, and all torrents sharing it;
+- any errors (failed deletions or relinks, or the script itself failing).
+
+Runs that change nothing send nothing.
+
 ## `maintainerr_gate.py`: deletion gate
 
 For every item in an active Maintainerr collection that is due within
@@ -240,6 +253,7 @@ See `config.yaml.example`. Key settings:
 | `dedupe.enabled` | Run the duplicate-copy check at the end of the cleaner |
 | `dedupe.min_size_mb` | Ignore files smaller than this (default 50) |
 | `dedupe.relink` | Replace confirmed duplicates with hardlinks automatically (default false) |
+| `notify.enabled` | Send the cleaner's Telegram summary (default false) |
 | `logging.*` | See [Logging and debugging](#logging-and-debugging) |
 
 ## Scheduling (cron)

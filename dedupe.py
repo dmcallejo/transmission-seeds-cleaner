@@ -111,13 +111,13 @@ def find_duplicates(index, library_dirs: List[str], torrent_dirs: List[str],
     return groups
 
 
-def relink(transmission, groups: List[Dict]) -> Tuple[int, int]:
-    """Replace duplicate paths with hardlinks to the kept copy. Returns (paths relinked, failures)."""
+def relink(transmission, groups: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """Replace duplicate paths with hardlinks to the kept copy. Returns (relinked, failed) event lists."""
     client = transmission.client
     targets = {p for g in groups for c in g['replace'] for p in c['paths']}
     torrent_ids = sorted({t for g in groups for c in g['replace'] for t in c['torrents']})
     if not targets:
-        return 0, 0
+        return [], []
     was_running = []
     if torrent_ids:
         for t in client.get_torrents(torrent_ids, arguments=['id', 'status']):
@@ -125,10 +125,11 @@ def relink(transmission, groups: List[Dict]) -> Tuple[int, int]:
                 was_running.append(t.id)
         client.stop_torrent(torrent_ids)
         time.sleep(3)
-    done = failed = 0
+    done, failed = [], []
     try:
         for g in groups:
             keep = g['keep']['paths'][0]
+            group_ok = True
             for copy in g['replace']:
                 for path in copy['paths']:
                     try:
@@ -140,11 +141,16 @@ def relink(transmission, groups: List[Dict]) -> Tuple[int, int]:
                         tmp = path + '.dedupe-tmp'
                         os.link(keep, tmp)
                         os.replace(tmp, path)
-                        done += 1
                         logging.info("dedupe: relinked %s -> inode %s", path, ks.st_ino)
                     except Exception as e:
-                        failed += 1
+                        group_ok = False
+                        failed.append({'path': path, 'torrents': copy['torrents'], 'error': str(e)})
                         logging.error("dedupe: could not relink %s: %s", path, e)
+            if group_ok:
+                done.append({'size': g['size'] * len(g['replace']), 'keep': keep,
+                             'paths': [p for c in g['replace'] for p in c['paths']],
+                             'torrents': sorted({t for c in g['replace'] for t in c['torrents']}
+                                                | set(g['keep']['torrents']))})
     finally:
         if was_running:
             client.start_torrent(was_running)
@@ -154,10 +160,12 @@ def relink(transmission, groups: List[Dict]) -> Tuple[int, int]:
     return done, failed
 
 
-def run(transmission, config: Dict, index_factory, relink_override: bool = None) -> None:
+def run(transmission, config: Dict, index_factory, relink_override: bool = None) -> Dict:
+    """Returns {'found': n, 'recoverable': bytes, 'relinked': [...], 'failed': [...], 'names': {id: name}}."""
     cfg = config.get('dedupe', {}) or {}
+    summary = {'found': 0, 'recoverable': 0, 'relinked': [], 'failed': [], 'names': {}}
     if not cfg.get('enabled', False):
-        return
+        return summary
     do_relink = cfg.get('relink', False) if relink_override is None else relink_override
     min_size = int(cfg.get('min_size_mb', 50)) * 1024 ** 2
     cache_path = Path(cfg.get('cache_file', CACHE_FILE))
@@ -173,6 +181,8 @@ def run(transmission, config: Dict, index_factory, relink_override: bool = None)
     cache_path.write_text(json.dumps(cache))
 
     wasted = sum(g['size'] * len(g['replace']) for g in groups)
+    summary.update(found=len(groups), recoverable=wasted,
+                   names={tid: info['name'] for tid, info in index.torrents.items()})
     logging.info("dedupe: %d duplicate group(s), %.1f GiB recoverable", len(groups), wasted / 1024 ** 3)
     for g in groups:
         def fmt(c):
@@ -183,6 +193,8 @@ def run(transmission, config: Dict, index_factory, relink_override: bool = None)
             logging.info("  replace %s", fmt(c))
     if groups and do_relink:
         done, failed = relink(transmission, groups)
-        logging.info("dedupe: %d path(s) relinked, %d failed", done, failed)
+        summary.update(relinked=done, failed=failed)
+        logging.info("dedupe: %d group(s) relinked, %d path(s) failed", len(done), len(failed))
     elif groups:
         logging.info("dedupe: report only (set dedupe.relink: true or pass --relink to fix)")
+    return summary

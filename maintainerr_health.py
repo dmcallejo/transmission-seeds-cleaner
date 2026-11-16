@@ -217,19 +217,8 @@ def missing_requested(maintainerr: Maintainerr, arr_data) -> List[Dict]:
 
 
 def telegram(maintainerr: Maintainerr, text: str) -> None:
-    agent = next((c for c in maintainerr.get('/notifications/configurations')
-                  if c.get('agent') == 'telegram' and c.get('enabled')), None)
-    if not agent:
-        raise RuntimeError('no enabled Telegram agent in Maintainerr')
-    opts = agent['options']
-    data = urllib.parse.urlencode({
-        'chat_id': opts['chatId'], 'text': text, 'parse_mode': 'HTML',
-        'disable_notification': 'true' if opts.get('sendSilently') else 'false',
-    }).encode()
-    req = urllib.request.Request(f"https://api.telegram.org/bot{opts['botAuthToken']}/sendMessage", data=data)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        if not json.loads(r.read()).get('ok'):
-            raise RuntimeError('Telegram API returned not ok')
+    import notify
+    notify.send(maintainerr.url, text)
 
 
 def html(s: str) -> str:

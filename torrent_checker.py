@@ -1027,6 +1027,10 @@ def prompt_delete_flagged(
         print("\n✗ Deletion cancelled.")
 
 
+# What this run changed, for the end-of-run Telegram summary.
+RUN_REPORT: Dict[str, list] = {'deleted': [], 'delete_failed': [], 'errors': []}
+
+
 def delete_torrents(transmission_client: TransmissionClient, flagged: List[Dict]) -> None:
     """
     Delete torrents and their files from Transmission.
@@ -1045,12 +1049,78 @@ def delete_torrents(transmission_client: TransmissionClient, flagged: List[Dict]
                 result['torrent_id'], result.get('flag_reason'), result['torrent_name'],
                 '' if delete_data else ' [data kept: path shared with another torrent]',
             )
+            RUN_REPORT['deleted'].append(result)
         except Exception as e:
             failures += 1
+            RUN_REPORT['delete_failed'].append({**result, 'error': str(e)})
             logging.error("Failed to delete torrent %s (%s): %s",
                           result['torrent_id'], result['torrent_name'], e)
             logging.debug("Traceback:", exc_info=True)
     logging.info("Deletion finished: %d removed, %d failed", len(flagged) - failures, failures)
+
+
+REASON_ES = {
+    'tracker_unavailable': 'eliminado del tracker',
+    'cross_seed_group_all_seeded': 'grupo sembrado 90+ días y fuera de Plex',
+    'not_hardlinked_with_more_than_two_seeds': 'fuera de Plex, sembrado, >2 seeds',
+    'missing_files': 'datos ya no existen',
+}
+
+
+def build_summary(dedupe_summary: Optional[Dict], freed_bytes: Optional[int]) -> Optional[str]:
+    """Spanish HTML summary of this run's changes, or None if nothing happened."""
+    from notify import html, gib
+    deleted, failed, errors = RUN_REPORT['deleted'], RUN_REPORT['delete_failed'], RUN_REPORT['errors']
+    d = dedupe_summary or {}
+    relinked, relink_failed = d.get('relinked', []), d.get('failed', [])
+    if not (deleted or failed or errors or relinked or relink_failed):
+        return None
+    names = d.get('names', {})
+    lines = ["🧹 <b>Limpieza de torrents</b>"]
+    if freed_bytes is not None and freed_bytes > 0:
+        lines.append(f"Espacio liberado: <b>{gib(freed_bytes)}</b>")
+    if deleted:
+        lines.append(f"\n<b>Torrents borrados ({len(deleted)})</b>")
+        for r in sorted(deleted, key=lambda r: r['torrent_name'].lower()):
+            data = '' if r.get('delete_data', True) else ', datos conservados'
+            lines.append(f"• #{r['torrent_id']} {html(r['torrent_name'])} "
+                         f"({gib(r.get('total_size', 0))}, {REASON_ES.get(r.get('flag_reason'), r.get('flag_reason'))}{data})")
+    if relinked:
+        total = sum(g['size'] for g in relinked)
+        lines.append(f"\n<b>Duplicados sustituidos por hardlinks ({len(relinked)}, {gib(total)})</b>")
+        for g in relinked:
+            tl = ', '.join(f"#{t} {html(names.get(t, '?'))}" for t in g['torrents'])
+            lines.append(f"• {html(Path(g['keep']).name)} ({gib(g['size'])})\n   torrents: {tl}")
+    if failed or relink_failed or errors:
+        lines.append("\n⚠️ <b>Errores</b>")
+        lines += [f"• borrar #{r['torrent_id']} {html(r['torrent_name'])}: {html(r['error'])}" for r in failed]
+        lines += [f"• hardlink {html(Path(r['path']).name)}: {html(r['error'])}" for r in relink_failed]
+        lines += [f"• {html(e)}" for e in errors]
+    lines.append(f"\n<i>Detalle: logs/torrent_checker.log, ejecución {RUN_ID}</i>")
+    return '\n'.join(lines)
+
+
+def send_summary(config: Dict, dedupe_summary: Optional[Dict], freed_bytes: Optional[int]) -> None:
+    ncfg = config.get('notify', {}) or {}
+    if not ncfg.get('enabled', False):
+        return
+    text = build_summary(dedupe_summary, freed_bytes)
+    if not text:
+        logging.info("No changes this run; no Telegram summary")
+        return
+    try:
+        import notify
+        notify.send((config.get('maintainerr', {}) or {}).get('url', 'http://localhost:6246'), text)
+    except Exception as e:
+        logging.error("Could not send Telegram summary: %s", e)
+
+
+def _free_bytes(paths: List[str]) -> Optional[int]:
+    try:
+        st = os.statvfs(paths[0])
+        return st.f_bavail * st.f_frsize
+    except (OSError, IndexError):
+        return None
 
 
 def main():
@@ -1128,6 +1198,7 @@ def main():
         seeding_time_threshold_days = config.get(
             'seeding_time_threshold_days', config.get('age_threshold_days')
         )
+        free_before = _free_bytes(torrent_dirs)
         analysis = analyzer.analyze(seeding_time_threshold_days)
         
         # Output results
@@ -1151,10 +1222,11 @@ def main():
         
         # Duplicate copies that could be hardlinks (after deletions, so removed
         # torrents are not considered). Report-only unless relinking is enabled.
+        dedupe_summary = None
         if not args.no_dedupe and not args.json:
             import dedupe
             try:
-                dedupe.run(
+                dedupe_summary = dedupe.run(
                     transmission, config,
                     lambda: TorrentLinkIndex(
                         transmission, transmission.get_all_torrents(),
@@ -1165,12 +1237,22 @@ def main():
             except Exception as e:
                 logging.error("dedupe failed: %s", e)
                 logging.debug("Traceback:", exc_info=True)
+                RUN_REPORT['errors'].append(f"comprobación de duplicados: {e}")
 
+        free_after = _free_bytes(torrent_dirs)
+        freed = (free_after - free_before) if None not in (free_before, free_after) else None
+        if not args.json:
+            send_summary(config, dedupe_summary, freed)
         logging.info("=== torrent_checker done ===")
         
     except (FileNotFoundError, ValueError, Exception) as e:
         logging.error("Error: %s", e)
         logging.debug("Traceback:", exc_info=True)
+        RUN_REPORT['errors'].append(f"el limpiador falló: {e}")
+        try:
+            send_summary(config, None, None)
+        except Exception:
+            pass
         sys.exit(1)
 
 
